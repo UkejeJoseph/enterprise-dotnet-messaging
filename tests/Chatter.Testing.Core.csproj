@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Shared test-support library: provides xunit's FactAttribute base type to consuming test projects.
+         It contains no tests of its own, so referencing xunit must NOT flip the SDK's IsTestProject flag
+         (which would make `dotnet test` launch a runnerless testhost against it and abort the run). -->
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Creators\MessageBrokers\AzureServiceBus\**" />
+    <EmbeddedResource Remove="Creators\MessageBrokers\AzureServiceBus\**" />
+    <None Remove="Creators\MessageBrokers\AzureServiceBus\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Creators\AzureServiceBus\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.8" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Moq" Version="4.20.72" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\Chatter.MessageBrokers.Reliability.EntityFramework\src\Chatter.MessageBrokers.Reliability.EntityFramework\Chatter.MessageBrokers.Reliability.EntityFramework.csproj" />
+  </ItemGroup>
+
+</Project>

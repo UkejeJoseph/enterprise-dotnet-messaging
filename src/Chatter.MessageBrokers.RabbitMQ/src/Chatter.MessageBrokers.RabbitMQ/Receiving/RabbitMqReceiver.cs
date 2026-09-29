@@ -1,0 +1,814 @@
+using Chatter.MessageBrokers.Context;
+using Chatter.MessageBrokers.Receiving;
+using Chatter.MessageBrokers.RabbitMQ.Configuration;
+using Microsoft.Extensions.Logging;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using System.Transactions;
+
+namespace Chatter.MessageBrokers.RabbitMQ.Receiving
+{
+    /// <summary>
+    /// The RabbitMQ <see cref="IMessagingInfrastructureReceiver"/>. Registers an AMQP push consumer on the
+    /// single serialized receive channel (via <see cref="IRabbitMqConnectionSource"/>), buffers each delivery
+    /// into a bounded <see cref="Channel{T}"/>, and surfaces them one-at-a-time through the blocking pull of
+    /// <see cref="ReceiveMessageAsync"/> so the core receive loop async-parks when no message is available.
+    /// </summary>
+    /// <remarks>
+    /// INVARIANT: every receive-channel operation (consume registration, ack, nack, deadletter ack) runs only
+    /// under the connection-source gate — settlement via <see cref="IRabbitMqConnectionSource.RunOnReceiveChannelAsync{TResult}"/>,
+    /// consume registration via <see cref="IRabbitMqConnectionSource.StartReceivingAsync"/> — because AMQP
+    /// channels are not thread-safe and a delivery tag is valid only on its owning channel.
+    /// INVARIANT (closed-by-construction epoch): the receiver hands the source a consume-registration delegate;
+    /// the source re-runs it on every receive-channel (re)creation (cold start, lazy recreate, recovery) with the
+    /// freshly-bumped epoch, which the delegate stamps onto every delivery it buffers. The delegate does NOT close
+    /// over a one-time epoch — each (re)registration receives the current epoch as a parameter — so a
+    /// post-recovery delivery always carries the post-recovery epoch and a pre-recovery in-flight delivery keeps
+    /// the pre-recovery epoch. The bounded <c>_buffer</c> is created ONCE in InitializeAsync and is NOT recreated
+    /// on re-registration, so deliveries buffered before recovery survive the consumer swap.
+    /// INVARIANT: ack/nack/deadletter are epoch-guarded — if the delivery's carried channel-epoch no longer
+    /// matches the current receive-channel epoch the channel was recycled, the broker has already redelivered
+    /// the message, and the settlement does not happen (never a false-ack against a recycled delivery tag). That
+    /// is reported as a FAILED settlement: it was attempted and did not happen.
+    /// INVARIANT: <see cref="MessageContext.ReceiveAttempts"/> is stamped (as <see cref="int"/>) on every
+    /// received message — the core's default <c>MessageDeliveryCountAsync</c> honours the stored value only when it
+    /// is present AND an integral value (<see cref="sbyte"/>, <see cref="byte"/>, <see cref="short"/>,
+    /// <see cref="ushort"/>, <see cref="int"/>, <see cref="uint"/>, <see cref="long"/>, <see cref="ulong"/>) lying
+    /// within <c>[0, int.MaxValue]</c>, and otherwise answers with the <see cref="int.MaxValue"/> dead-letter
+    /// sentinel. An unstamped delivery, or one carrying a non-integral or out-of-range value, therefore keeps no
+    /// retry budget at all and deadletters on its first handler error.
+    /// INVARIANT (TransactionMode.None at-most-once): under <see cref="TransactionMode.None"/> the consumer is
+    /// registered with autoAck:true — the AMQP ReceiveAndDelete equivalent the sibling ASB adapter uses — so the
+    /// broker removes the delivery as it pushes it, BEFORE the handler runs, closing the crash/kill-window
+    /// redelivery that manual-ack would leave open. With no manual delivery tag to settle, ack/nack/deadletter
+    /// report NOT-REQUIRED under None (the message is already gone, so no settlement is owed). Every other mode
+    /// keeps manual ack (autoAck:false) and the epoch-guarded settlement + retry/deadletter paths.
+    /// </remarks>
+    internal sealed class RabbitMqReceiver : IMessagingInfrastructureReceiver
+    {
+        // The native quorum-queue delivery counter. On RabbitMQ 4.3+ the broker advances it per FAILED delivery
+        // (basic.reject or a lost consumer), not per basic.nack return; before 4.3 it advances per redelivery.
+        private const string _nativeDeliveryCountHeader = "x-delivery-count";
+
+        // The native quorum-queue assignment counter RabbitMQ 4.3+ stamps on each redelivery. Withheld at the capture
+        // point (BufferDeliveryAsync); not an attempt source (ADR-0042).
+        private const string _nativeAcquiredCountHeader = "x-acquired-count";
+
+        // The settlement contract requires every unsettled outcome to explain itself; these are the two
+        // delivery-independent explanations this receiver reports.
+        private const string _atMostOnceNothingToSettleReason =
+            "TransactionMode.None registers the consumer with autoAck:true, so the broker removed the delivery at receive; there is no manual delivery tag to settle";
+        private const string _noCarriedDeliveryReason =
+            "the context carries no " + nameof(ReceivedMessage) + ", so the delivery to settle could not be located";
+
+        /// <summary>
+        /// One buffered delivery: the <see cref="ReceivedMessage"/> the Receiver carries onward, and the number of
+        /// prior deliveries read at the capture point from the header the queue type counts attempts with.
+        /// </summary>
+        private readonly record struct BufferedDelivery(ReceivedMessage Message, int PriorDeliveries);
+
+        private readonly IRabbitMqConnectionSource _connectionSource;
+        private readonly RabbitMqOptions _rabbitOptions;
+        private readonly IBodyConverterFactory _bodyConverterFactory;
+        private readonly ILogger<RabbitMqReceiver> _logger;
+
+        private Channel<BufferedDelivery> _buffer;
+        private ReceiverOptions _options;
+        private int _prefetch;
+        // TransactionMode.None is at-most-once: the broker must drop the delivery as it is pushed (no crash-window
+        // redelivery), so the consumer registers with autoAck:true — the AMQP ReceiveAndDelete equivalent the
+        // sibling ASB adapter uses for None. Resolved ONCE in InitializeAsync from the (core-normalized) options
+        // and read by RegisterConsumerAsync on every (re)registration and by the settlement no-op guard.
+        private bool _autoAck;
+
+        public RabbitMqReceiver(IRabbitMqConnectionSource connectionSource,
+                                RabbitMqOptions rabbitOptions,
+                                IBodyConverterFactory bodyConverterFactory,
+                                ILogger<RabbitMqReceiver> logger)
+        {
+            _connectionSource = connectionSource ?? throw new ArgumentNullException(nameof(connectionSource));
+            _rabbitOptions = rabbitOptions ?? throw new ArgumentNullException(nameof(rabbitOptions));
+            _bodyConverterFactory = bodyConverterFactory ?? throw new ArgumentNullException(nameof(bodyConverterFactory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task InitializeAsync(ReceiverOptions options, CancellationToken cancellationToken)
+        {
+            _options = options ?? throw new ArgumentNullException(nameof(options));
+
+            // INVARIANT (stop-authority lives on the SOURCE, not on a per-instance flag): ONE receiver exists per
+            // AddRabbitMq registration — it is constructed at the single site in Extensions.cs, is neither
+            // container-resolvable nor publicly constructible, and the IMessagingInfrastructure factory hands that
+            // same instance back on every Create(). So "did the core drive THIS instance through startup?" is not a
+            // question any path here has to answer. What decides whether a stop has work to do is the source's own
+            // registration state (_registerConsumer / _consumerTag / _receiveChannel), which StopReceivingAsync reads
+            // and clears.
+            // This DISSOLVES ADR-0019 section 5's positional constraint rather than satisfying it. That section argued
+            // an initialization latch had to sit ABOVE every startup gate below, because StartReceivingAsync stores the
+            // registration delegate BEFORE it ensures the receive channel — so a startup that faults mid-registration
+            // leaves a stored delegate that only a stop clears, and a latch set too late would dispose without
+            // stopping, letting a later recovery re-register a consumer that writes into a completed buffer. With the
+            // latch deleted there is no position to get wrong: dispose runs the stop unconditionally, so the stored
+            // delegate is cleared no matter where the fault landed. Deleting the latch is therefore SAFER than keeping
+            // it correctly positioned, not merely simpler.
+
+            // TransactionMode.None is at-most-once ("if an error occurs after a message is received, it will be
+            // lost"). The handler-failure path already drops (acks) under None, but a process CRASH/KILL while the
+            // handler runs leaves a manual-ack delivery UNacked, so the broker redelivers it on reconnect — that is
+            // at-least-once, NOT at-most-once, and it diverges from the sibling ASB adapter (which receives None in
+            // ReceiveAndDelete, deleting the delivery at receive). Close the crash window by construction: register
+            // the consumer with autoAck:true under None so the broker removes the delivery as it pushes it, BEFORE
+            // the handler runs. There is then no manual delivery tag to settle, so Ack/Nack/Deadletter become
+            // no-ops under None (the message is already gone). _options.TransactionMode is core-normalized before
+            // InitializeAsync runs, so it is authoritative here.
+            _autoAck = _options.TransactionMode == TransactionMode.None;
+
+            // FAIL FAST AT REGISTRATION: a poison message that exhausts MaxReceiveAttempts is deadlettered via an
+            // explicit publish to the configured DeadLetterQueuePath/ErrorQueuePath. When NEITHER is configured the
+            // deadletter has no valid destination, so the original delivery can never be settled and is redelivered
+            // indefinitely (a poison-message hot loop). DeadletterMessageAsync still throws on that misconfiguration
+            // as defense-in-depth, but the core BrokeredMessageReceiver.TryDeadletterWithRecoveryAsync CATCHES any
+            // DeadletterMessageAsync exception and merely logs it — so the deadletter-time throw alone cannot stop the
+            // hot loop. Rejecting here, BEFORE StartReceivingAsync registers the AMQP consumer, makes the
+            // unconfigured-poison-target class unreachable: the receiver never begins consuming without a valid poison
+            // destination, surfacing the misconfiguration at startup (naming the queue) instead of silently looping.
+            // EXCEPTION: TransactionMode.None is at-most-once — a poison message is dropped (acked), never republished
+            // to a deadletter/error queue (see NackMessageAsync/DeadletterMessageAsync), so None has no poison target
+            // to require. The core normalizes _options.TransactionMode (folding in the global default) BEFORE this
+            // runs, so it is authoritative here.
+            if (_options.TransactionMode != TransactionMode.None
+                && string.IsNullOrWhiteSpace(_options.DeadLetterQueuePath) && string.IsNullOrWhiteSpace(_options.ErrorQueuePath))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot start the RabbitMQ receiver for queue '{_options.MessageReceiverPath}': neither a dead-letter queue " +
+                    $"({nameof(ReceiverOptions.DeadLetterQueuePath)}) nor an error queue ({nameof(ReceiverOptions.ErrorQueuePath)}) " +
+                    "is configured. A poison message that exhausts MaxReceiveAttempts would otherwise have no valid deadletter " +
+                    "destination and be redelivered indefinitely. Configure a dead-letter or error queue before receiving.");
+            }
+
+            // The gate above proves a poison destination was NAMED; this one proves it EXISTS.
+            await AssertPoisonDestinationsExistAsync(cancellationToken).ConfigureAwait(false);
+
+            // Prefetch must keep enough unacknowledged deliveries in flight to saturate the core's workers, so
+            // floor it at MaxConcurrentCalls. The bounded buffer mirrors that prefetch so the consumer never
+            // accepts more than the broker is willing to leave unacknowledged.
+            // AMQP prefetch is a ushort on the wire: BasicQosAsync takes a ushort prefetchCount, so the resolved
+            // int MUST be clamped to [1, ushort.MaxValue] BEFORE it is cast. The public options (RabbitMqOptions.Prefetch
+            // and ReceiverOptions.MaxConcurrentCalls) do not reject high values, so without this clamp a configured
+            // value above 65,535 would WRAP on the cast — e.g. 65,536 -> 0, which RabbitMQ interprets as UNLIMITED
+            // prefetch (removing all backpressure), and other large values would silently under-prefetch. Saturate
+            // at ushort.MaxValue instead so a misconfiguration degrades to the maximum supported prefetch, never to 0.
+            _prefetch = ClampPrefetch(Math.Max(Math.Max(1, _rabbitOptions.Prefetch), options.MaxConcurrentCalls));
+            _buffer = System.Threading.Channels.Channel.CreateBounded<BufferedDelivery>(
+                new BoundedChannelOptions(_prefetch)
+                {
+                    SingleReader = false,
+                    SingleWriter = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+
+            // Hand the source the consume-registration delegate. The source runs it now and re-runs it on every
+            // receive-channel (re)creation (lazy recreate, recovery) under the gate, passing the FRESH epoch each
+            // time. The delegate stamps that per-invocation epoch onto every buffered delivery, so a later ack can
+            // detect a recycled channel. The epoch is NOT closed over once at InitializeAsync — it is the per-call
+            // parameter the source supplies, so a post-recovery re-registration stamps the post-recovery epoch.
+            await _connectionSource.StartReceivingAsync(RegisterConsumerAsync, cancellationToken).ConfigureAwait(false);
+        }
+
+        // FAIL FAST AT REGISTRATION (existence half): the neither-configured gate only proves a poison destination
+        // was NAMED. This module PROVISIONS NO TOPOLOGY, so a dead-letter/error queue named in configuration but
+        // never declared externally does not exist on the broker — and DeadletterMessageAsync's mandatory:true
+        // republish then faults with a PublishException. The core's TryDeadletterWithRecoveryAsync CATCHES that,
+        // logs it, and leaves the ORIGINAL delivery unsettled; at the default Prefetch of 1 that unacked delivery
+        // holds the receiver's only broker credit, so the receiver STALLS INDEFINITELY on the first poison message
+        // and the misconfiguration surfaces only as a log line. Probing existence here, BEFORE StartReceivingAsync
+        // registers the AMQP consumer, turns that silent stall into a loud startup failure naming the queue.
+        // EXCEPTION: TransactionMode.None is at-most-once — a poison message is dropped (acked), never republished
+        // — so it requires no poison destination and probes none, mirroring the neither-configured gate's own
+        // exception.
+        // CHANNEL CHOICE: a PASSIVE declare PROVISIONS NOTHING (it only asks the broker whether the queue exists),
+        // so the no-topology invariant holds. It runs on a channel rented from the publish pool, never on the
+        // receive channel, because a FAILED passive declare CLOSES its channel — killing the receive channel would
+        // take the receiver down with it. The rental's return path disposes a closed channel instead of re-pooling
+        // it while ALWAYS releasing the permit, so the pool self-heals after a failed probe.
+        private async Task AssertPoisonDestinationsExistAsync(CancellationToken cancellationToken)
+        {
+            if (_options.TransactionMode == TransactionMode.None)
+            {
+                return;
+            }
+
+            await using var rental = await _connectionSource.AcquirePublishChannelAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(_options.DeadLetterQueuePath))
+            {
+                await AssertQueueExistsAsync(rental.Channel, _options.DeadLetterQueuePath, nameof(ReceiverOptions.DeadLetterQueuePath), cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!string.IsNullOrWhiteSpace(_options.ErrorQueuePath))
+            {
+                await AssertQueueExistsAsync(rental.Channel, _options.ErrorQueuePath, nameof(ReceiverOptions.ErrorQueuePath), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // INVARIANT: ONLY a 404 NOT_FOUND means the queue does not exist. Every other fault — connection refused,
+        // access refused, resource locked — propagates UNWRAPPED, so an infrastructure problem is never masked as a
+        // missing queue (which would send an operator to declare a queue that already exists).
+        private async Task AssertQueueExistsAsync(IChannel channel, string queue, string optionName, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await channel.QueueDeclarePassiveAsync(queue, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == Constants.NotFound)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot start the RabbitMQ receiver for queue '{_options.MessageReceiverPath}': the configured poison destination " +
+                    $"'{queue}' ({optionName}) does not exist on the broker. This adapter provisions no topology, so the queue must be " +
+                    "declared externally before receiving. A poison message that exhausts MaxReceiveAttempts would otherwise fault its " +
+                    "deadletter republish, leaving the original delivery unsettled and stalling the receiver indefinitely.", ex);
+            }
+        }
+
+        // INVARIANT: invoked by the connection source under the receive gate on every (re)creation of the receive
+        // channel, with <paramref name="epoch"/> being the freshly-bumped epoch of that channel. Registers a fresh
+        // push consumer that stamps THIS epoch onto every delivery it buffers, and RETURNS the broker-assigned
+        // consumer tag so the SOURCE — which owns the receive channel + consumer lifecycle — stores it and cancels
+        // it on StopReceivingAsync. The bounded buffer is NOT recreated here (it is created once in InitializeAsync)
+        // so in-flight pre-recovery deliveries survive the swap.
+        private async Task<string> RegisterConsumerAsync(IChannel channel, long epoch, CancellationToken cancellationToken)
+        {
+            await channel.BasicQosAsync(prefetchSize: 0,
+                                        prefetchCount: (ushort)_prefetch,
+                                        global: false,
+                                        cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.ReceivedAsync += (sender, delivery) => BufferDeliveryAsync(delivery, epoch);
+
+            // Return the broker-assigned consumer tag so the source stores it and owns cancellation. The tag may
+            // change across recovery as the consumer is re-registered; the source re-captures it each (re)creation.
+            // autoAck:true ONLY under TransactionMode.None (at-most-once: the broker deletes the delivery as it is
+            // pushed, closing the crash-window redelivery). Every other mode keeps manual ack so the epoch-guarded
+            // settlement + retry/deadletter paths own delivery acknowledgement.
+            return await channel.BasicConsumeAsync(queue: _options.MessageReceiverPath,
+                                                   autoAck: _autoAck,
+                                                   consumerTag: string.Empty,
+                                                   noLocal: false,
+                                                   exclusive: false,
+                                                   arguments: null,
+                                                   consumer: consumer,
+                                                   cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+
+        // INVARIANT: the push consumer's only job is to wrap the delivery (carrying the registration-time epoch)
+        // and enqueue it into the bounded buffer. When the buffer is full WriteAsync async-parks here, which
+        // back-pressures the broker exactly to prefetch.
+        // INVARIANT: the curated native AMQP property set is captured here ONCE through the single translation
+        // contract (RabbitMqMessageTranslator.CaptureFacts) from the delivery's IReadOnlyBasicProperties, so every
+        // native property the broker delivered survives onto ReceivedMessage as the republish-carry facts and is
+        // re-applied through the translator on a republish hop. Without this capture the republish rebuilt
+        // BasicProperties from scratch and dropped every delivered native property (e.g. a classic-queue per-message
+        // TTL lost on the first redelivery).
+        // COUNTER OWNERSHIP: a counter header is carried onward only by the party that stamps it. The adapter stamps
+        // x-chatter-delivery-count, so ReceivedMessage.Headers carries it and the classic redelivery hop re-stamps it
+        // (BuildClassicRedeliveryHeaders). The broker stamps x-delivery-count and x-acquired-count about the delivery
+        // it has just made, so they are read-only to the Receiver and are consumed HERE, at the receive boundary:
+        // read once for the attempt count, then withheld from the ReceivedMessage every later step works from.
+        // INVARIANT: the broker-owned counters do not exist downstream of this capture point, so neither the emitted
+        // core context nor any republish hop (dead-letter, Error Queue, classic redelivery) can carry them. Pinned by
+        // WhenReceivingMessage.MustStripNativeDeliveryCountHeaderWhilePreservingOtherHeaders,
+        // .MustStripNativeAcquiredCountHeaderWhilePreservingOtherHeaders and
+        // .MustResolveReceiveAttemptsFromDeliveryCountWhenBothQuorumCountersArePresent, and by
+        // WhenSettlingMessage.MustNotRepublishNativeQuorumCountersOnTheDeadletterHop, .OnTheErrorQueueHop and
+        // .OnTheClassicRedeliveryHop. Mutation: carry the natives through (delete the two carriedHeaders.Remove
+        // calls below). Measured: reddens exactly those six of the module's 366 unit facts.
+        // INVARIANT: the RECEIVE attempt count is derived once, at this capture point, from the key the queue type
+        // selects (ReadPriorDeliveries: x-delivery-count on a quorum queue, x-chatter-delivery-count on a classic
+        // queue), and reaches ReceiveMessageAsync as BufferedDelivery.PriorDeliveries. The classic republish stamp is
+        // computed separately at settlement, in BuildClassicRedeliveryHeaders, from the same adapter-owned
+        // x-chatter-delivery-count with the same normalization. Pinned on the quorum arm by
+        // WhenReceivingMessage.MustResolveReceiveAttemptsFromDeliveryCountWhenBothQuorumCountersArePresent
+        // (x-delivery-count 2 beside x-acquired-count 9 resolves ReceiveAttempts 3), and on the classic arm by
+        // WhenSettlingMessage.MustNotRepublishNativeQuorumCountersOnTheClassicRedeliveryHop (x-chatter-delivery-count 1
+        // beside x-delivery-count 2 and x-acquired-count 7 resolves ReceiveAttempts 2). Mutations, each measured on
+        // the module's 366 unit facts: selecting x-acquired-count as the quorum key reddens 11 (the both-counters fact
+        // and every fact that reads a quorum count); reading x-acquired-count as a max beside the selected key on
+        // every arm reddens 3 (the both-counters fact, the classic redelivery-hop fact and
+        // MustStripNativeAcquiredCountHeaderWhilePreservingOtherHeaders); reading it as a max on the classic arm only
+        // reddens the classic redelivery-hop fact alone; selecting x-delivery-count on the classic arm reddens 5 (the
+        // classic redelivery-hop fact and four classic count-reading facts).
+        // NOTE: why x-acquired-count is not an attempt source (ADR-0042) — it counts assignments to a consumer, not
+        // failed deliveries, so a consumer timeout or an intra-cluster partition advances it with no handler failing,
+        // and reading it would spend a healthy message's retry budget — is broker behavior no test pins. The
+        // RabbitMqDeliveryCountingOn43Tests facts cannot tell the two counters apart, because both climb under
+        // basic.reject.
+        private async Task BufferDeliveryAsync(BasicDeliverEventArgs delivery, long epoch)
+        {
+            var properties = delivery.BasicProperties;
+            var facts = RabbitMqMessageTranslator.CaptureFacts(properties);
+
+            var carriedHeaders = properties?.Headers is { } deliveredHeaders
+                ? new Dictionary<string, object>(deliveredHeaders)
+                : new Dictionary<string, object>();
+            var priorDeliveries = ReadPriorDeliveries(carriedHeaders);
+            carriedHeaders.Remove(_nativeDeliveryCountHeader);
+            carriedHeaders.Remove(_nativeAcquiredCountHeader);
+
+            var received = new ReceivedMessage(body: delivery.Body.ToArray(),
+                                               deliveryTag: delivery.DeliveryTag,
+                                               channelEpoch: epoch,
+                                               headers: carriedHeaders,
+                                               exchange: delivery.Exchange,
+                                               routingKey: delivery.RoutingKey,
+                                               redelivered: delivery.Redelivered,
+                                               messageId: facts.MessageId,
+                                               expiration: facts.Expiration,
+                                               priority: facts.Priority,
+                                               timestamp: facts.Timestamp,
+                                               type: facts.Type,
+                                               appId: facts.AppId,
+                                               contentEncoding: facts.ContentEncoding,
+                                               contentType: facts.ContentType,
+                                               correlationId: facts.CorrelationId);
+
+            await _buffer.Writer.WriteAsync(new BufferedDelivery(received, priorDeliveries), delivery.CancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<MessageBrokerContext> ReceiveMessageAsync(TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            // Blocking pull: async-park when the buffer is empty (no poll, no spin) until the push consumer
+            // enqueues a delivery or the loop token cancels.
+            var buffered = await _buffer.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var received = buffered.Message;
+
+            var receiveAttempts = ResolveReceiveAttempts(buffered.PriorDeliveries);
+
+            // Seed the context through the SINGLE translation contract: the delivered header table is decoded
+            // (string-typed header keys byte[]->string so the core's type-tested string reads see the header's real
+            // value — an undecoded byte[] reads as default there, losing the value silently), the native
+            // frame fields with a core concept are surfaced (ContentType -> GAP B, CorrelationId dual-home), and
+            // the native Expiration is reconstituted into MessageContext.TimeToLive (GAP A). The C-family natives
+            // stay on the facts only (DECISION-B), never in the core context. This matches the other adapters that
+            // copy inbound application properties before adding infrastructure stamps. Infrastructure keys are then
+            // stamped ON TOP, so a fresh DeliveryTag / ChannelEpoch / InfrastructureType / ReceiveAttempts always
+            // wins over any inbound value of the same key.
+            var (headers, deliveredContentType) = RabbitMqMessageTranslator.ToCore(FactsFrom(received), received.Headers);
+
+            // INVARIANT: the OUTBOUND dispatch-override command keys (TargetExchange / RoutingKey) must NEVER be
+            // carried from an inbound delivery. Only .WithRabbitMqRouting writes them and the sender reads them; the
+            // core seeds an outbound send's options from the inbound context, so preserving an inbound copy of these
+            // would silently re-route every receive-then-send follow-up back toward the inbound queue. They are
+            // stripped here (a round-tripped message can carry them because the sender publishes the full context as
+            // headers), independent of the broker-supplied delivery.Exchange / delivery.RoutingKey, which are also
+            // never stamped.
+            headers.Remove(RabbitMqMessageContext.TargetExchange);
+            headers.Remove(RabbitMqMessageContext.RoutingKey);
+
+            // INVARIANT: the adapter-owned x-chatter-delivery-count is receive state, never outbound payload.
+            // ReceivedMessage carries it so the classic redelivery hop can re-stamp it, but the core seeds a
+            // receive-then-send follow-up's options from THIS context and RabbitMqSender publishes the full context
+            // as headers, so a copy left here would ride onto the next send and be read on the next queue's first
+            // delivery as a stale redelivery count. Pinned by
+            // WhenReceivingMessage.MustStripClassicDeliveryCountHeaderWhilePreservingOtherHeaders. Mutation: delete
+            // the Remove below. Measured: reddens that fact alone of the module's 366 unit facts.
+            // The broker-owned counters need no strip here: they were consumed at the capture point (see the
+            // counter-ownership INVARIANTs on BufferDeliveryAsync).
+            headers.Remove(RabbitMqMessageContext.DeliveryCountHeader);
+
+            headers[RabbitMqMessageContext.DeliveryTag] = received.DeliveryTag;
+            headers[RabbitMqMessageContext.ChannelEpoch] = received.ChannelEpoch;
+            headers[MessageContext.InfrastructureType] = RabbitMqMessageContext.InfrastructureType;
+            // MANDATORY: stamped on EVERY message as an int. The core's default MessageDeliveryCountAsync honours
+            // this value only when it is present AND integral (sbyte, byte, short, ushort, int, uint, long, ulong)
+            // within [0, int.MaxValue], and otherwise answers with the int.MaxValue dead-letter sentinel — so an
+            // absent, non-integral or out-of-range value costs the delivery its entire retry budget and
+            // deadletters it on the first handler error.
+            headers[MessageContext.ReceiveAttempts] = receiveAttempts;
+
+            var messageId = string.IsNullOrEmpty(received.MessageId) ? Guid.NewGuid().ToString() : received.MessageId;
+            // GAP B: pick the body converter from the DELIVERED content-type when the delivery carried one, so the
+            // emitted context deserializes with the converter that matches what the publisher actually serialized.
+            // Fall back to the converter resolved for the configured MessageBodyType otherwise; an unknown
+            // content-type falls back to the core JsonBodyConverter inside the factory (never throws).
+            var bodyConverterContentType = string.IsNullOrWhiteSpace(deliveredContentType)
+                ? _rabbitOptions.MessageBodyType
+                : deliveredContentType;
+            var bodyConverter = _bodyConverterFactory.CreateBodyConverter(bodyConverterContentType);
+            var messageContext = new MessageBrokerContext(messageId,
+                                                          received.Body,
+                                                          headers,
+                                                          _options.MessageReceiverPath,
+                                                          cancellationToken,
+                                                          bodyConverter);
+            // Carry the raw delivery so the settlement methods recover the delivery tag and epoch.
+            messageContext.Container.Include(received);
+
+            return messageContext;
+        }
+
+        // Quorum queues expose the broker's native x-delivery-count (number of prior redeliveries); attempts is
+        // that count + 1. Classic queues carry the adapter's own x-chatter-delivery-count holding the number of PRIOR
+        // deliveries (0 when absent on the first delivery, advanced on each republish); attempts is likewise that
+        // count + 1. BOTH paths floor the first delivery at attempt 1 — the shared receiver contract treats an actual
+        // delivery as at least the first attempt, and the core deadletters only when deliveryCount >= MaxReceiveAttempts,
+        // so without the +1 a classic poison message with maxReceiveAttempts: 1 would be handled twice before
+        // deadlettering, unlike quorum.
+        // The delivery-count headers are broker-supplied and untrusted: a negative or oversized value would, if
+        // cast straight to int, stamp a negative or wrapped ReceiveAttempts that the core compares to
+        // MaxReceiveAttempts — letting a poison message dodge deadlettering or get a bogus retry budget. Saturate
+        // the raw long into a non-negative int before stamping.
+        private int ReadPriorDeliveries(IReadOnlyDictionary<string, object> deliveredHeaders)
+        {
+            var headerKey = _rabbitOptions.QueueType == QueueType.Quorum
+                ? _nativeDeliveryCountHeader
+                : RabbitMqMessageContext.DeliveryCountHeader;
+
+            return SaturateToNonNegativeInt(ReadHeaderAsLong(deliveredHeaders, headerKey, 0L));
+        }
+
+        private static int ResolveReceiveAttempts(int priorDeliveries)
+            => priorDeliveries == int.MaxValue ? int.MaxValue : priorDeliveries + 1;
+
+        // Clamp the resolved prefetch into the AMQP-wire ushort range [1, ushort.MaxValue] so the (ushort) cast at
+        // the BasicQosAsync call site cannot wrap. A configured value above 65,535 saturates at ushort.MaxValue
+        // (maximum supported prefetch) rather than wrapping to 0 (unlimited, no backpressure) or a much smaller
+        // value than requested; the floor of 1 keeps at least one delivery in flight.
+        private static int ClampPrefetch(int value)
+        {
+            if (value < 1)
+            {
+                return 1;
+            }
+
+            return value > ushort.MaxValue ? ushort.MaxValue : value;
+        }
+
+        // Clamp an untrusted broker-supplied counter into [0, int.MaxValue]: negatives become 0 and values above
+        // int.MaxValue saturate, so a malformed header can never produce a negative or wrapped attempt count.
+        private static int SaturateToNonNegativeInt(long value)
+        {
+            if (value <= 0L)
+            {
+                return 0;
+            }
+
+            return value >= int.MaxValue ? int.MaxValue : (int)value;
+        }
+
+        public Task<SettlementResult> AckMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            // TransactionMode.None registers the consumer with autoAck:true, so the broker already removed the
+            // delivery at receive time — there is no manual delivery tag to ack. NOTHING IS OWED: the at-most-once
+            // contract is already satisfied by the auto-ack, so this is NotRequired, never a failed settlement.
+            if (IsAtMostOnce(transactionContext))
+            {
+                return Task.FromResult(SettlementResult.NotRequired(_atMostOnceNothingToSettleReason));
+            }
+
+            if (!TryGetReceivedMessage(context, out var received))
+            {
+                _logger.LogTrace("No {receivedMessage} contained in context; nothing to acknowledge.", nameof(ReceivedMessage));
+                return Task.FromResult(SettlementResult.Failed(_noCarriedDeliveryReason));
+            }
+
+            return SettleOnReceiveChannelAsync(received, (channel) =>
+                channel.BasicAckAsync(received.DeliveryTag, multiple: false, cancellationToken), cancellationToken);
+        }
+
+        public Task<SettlementResult> NackMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            // TransactionMode.None is at-most-once (the enum contract: "if an error occurs after a message is
+            // received, it will be lost"), matching the sibling adapters — ASB receives in ReceiveAndDelete and
+            // SSB skips the transaction so a rollback cannot redeliver. Under None the consumer registers with
+            // autoAck:true, so the broker already removed the delivery at RECEIVE time (before the handler ran),
+            // closing the crash-window redelivery. A handler-failure nack therefore has nothing to settle — the
+            // message is already gone, NOT requeued or republished — so nothing is owed (the message is dropped).
+            if (IsAtMostOnce(transactionContext))
+            {
+                return Task.FromResult(SettlementResult.NotRequired(_atMostOnceNothingToSettleReason));
+            }
+
+            if (!TryGetReceivedMessage(context, out var received))
+            {
+                _logger.LogTrace("No {receivedMessage} contained in context; nothing to negatively acknowledge.", nameof(ReceivedMessage));
+                return Task.FromResult(SettlementResult.Failed(_noCarriedDeliveryReason));
+            }
+
+            if (_rabbitOptions.QueueType == QueueType.Classic)
+            {
+                // Classic queues have no native redelivery counter: republish to the receiver's own queue with an
+                // incremented x-chatter-delivery-count (publisher-confirmed) BEFORE acking the original, so the
+                // attempt count survives reconnect and horizontal scaling and the message is never lost. The
+                // delivered native Expiration is PRESERVED on this redelivery hop so a classic-queue message
+                // published with a per-message TTL keeps its TTL across the republish.
+                return RepublishThenAckAsync(received,
+                                             destination: _options.MessageReceiverPath,
+                                             headerOverrides: BuildClassicRedeliveryHeaders(received),
+                                             preserveExpiration: true,
+                                             cancellationToken: cancellationToken);
+            }
+
+            // INVARIANT: the quorum requeue verb is basic.reject(requeue: true). Pinned by
+            // WhenSettlingMessage.MustRejectWithRequeueOnNackForQuorum and, on the 4.3 fixture, by
+            // RabbitMqDeliveryCountingOn43Tests.QuorumQueueDeadlettersOnMaxReceivesOn43 and
+            // .QuorumQueueReceiveAttemptsClimbAcrossRedeliveriesOn43. Mutation: revert this call to
+            // BasicNackAsync(multiple: false, requeue: true). Measured: reddens exactly those three — 1 of the
+            // module's 366 unit facts and 2 of its 23 integration facts.
+            // INVARIANT: reject still redelivers and advances the receive attempt count before 4.3. Pinned by
+            // RabbitMqNackRedeliveryTests.ThrowingHandlerCausesRedeliveryAndClimbingReceiveAttempts on the 3.13
+            // fixture. Mutation: requeue: true -> requeue: false. Measured: reddens that fact and, beyond it,
+            // RabbitMqTransactionModeTests.ReceiveOnlyTransactionModeRedeliversOnThrow (3.13, quorum), the two 4.3
+            // facts above and MustRejectWithRequeueOnNackForQuorum — 1 of 366 unit facts and 4 of 23 integration
+            // facts. Of these, only the two 3.13 facts stay green under the BasicNackAsync revert.
+            // NOTE (ADR-0042): the broker counter semantics behind the verb — on RabbitMQ >= 4.3 basic.nack is a
+            // "returned" outcome that does not advance x-delivery-count, basic.reject is the "failed" outcome that
+            // does — are broker behavior; the 4.3 facts pin their consequence, not the counter table itself.
+            // NOTE: that the two verbs share one server path before 4.3, and are therefore behavior-identical there,
+            // is broker-internal behavior NO TEST PINS. No shipped fact issues basic.nack against a 3.13 broker; the
+            // measured BasicNackAsync revert leaving the 3.13 fact green is consistent with the shared path, not
+            // proof of it.
+            return SettleOnReceiveChannelAsync(received, (channel) =>
+                channel.BasicRejectAsync(received.DeliveryTag, requeue: true, cancellationToken), cancellationToken);
+        }
+
+        /// <summary>
+        /// Whether this receiver writes a failed delivery to the Error Queue itself, so the core must not run its
+        /// own error-recovery action for that delivery.
+        /// </summary>
+        /// <remarks>
+        /// INVARIANT (DO NOT COLLAPSE THIS BACK INTO THE SETTLEMENT OUTCOME): on the ERROR-ONLY configuration (no
+        /// dead-letter queue) <see cref="DeadletterMessageAsync"/> republishes the failed delivery to the Error
+        /// Queue ITSELF and then acks the original, so it truthfully reports <c>Settled</c> — it DID settle. The
+        /// core gates its error-recovery action (ErrorQueueDispatcher -> IForwardMessages) on
+        /// <c>IsSettled &amp;&amp; !WritesToErrorQueue</c>; keying it on the outcome ALONE would make the core
+        /// forward a SECOND copy of the same poison message to the SAME Error Queue. This control signal is what
+        /// lets the receiver report the truthful outcome AND suppress the duplicate write — before the seam
+        /// declared it, the only way to suppress the duplicate was to MISREPORT the settlement as not having
+        /// happened. With a dead-letter queue configured the receiver republishes to the DEAD-LETTER queue and
+        /// never touches the Error Queue, so the core keeps ownership of that write and this is <c>false</c>.
+        /// </remarks>
+        public bool WritesToErrorQueue => string.IsNullOrWhiteSpace(_options.DeadLetterQueuePath);
+
+        public async Task<SettlementResult> DeadletterMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, string deadLetterReason, string deadLetterErrorDescription, CancellationToken cancellationToken)
+        {
+            // TransactionMode.None is at-most-once: a poison message is LOST, not deadlettered (the enum contract
+            // and the sibling adapters' behaviour). Under None the consumer registers with autoAck:true, so the
+            // broker already removed the delivery at RECEIVE time — there is no delivery to ack and nothing to
+            // republish to the DLQ, so nothing is owed (the message is dropped). This also makes the InitializeAsync
+            // poison-target gate inapplicable under None (see InitializeAsync).
+            if (IsAtMostOnce(transactionContext))
+            {
+                return SettlementResult.NotRequired(_atMostOnceNothingToSettleReason);
+            }
+
+            if (!TryGetReceivedMessage(context, out var received))
+            {
+                _logger.LogTrace("No {receivedMessage} contained in context; nothing to deadletter.", nameof(ReceivedMessage));
+                return SettlementResult.Failed(_noCarriedDeliveryReason);
+            }
+
+            // INVARIANT (both paths): republish-confirmed BEFORE the original is acked so a crash between the two
+            // yields at-most a duplicate copy in the target queue, never loss of the poison message. The epoch guard
+            // inside RepublishThenAckAsync makes the ack a no-op on a recycled channel; the broker redelivers the
+            // original, and the error/DLQ already holds a durable copy (at-most a duplicate, never loss).
+            var headerOverrides = new Dictionary<string, object>
+            {
+                [MessageContext.FailureDetails] = deadLetterReason,
+                [MessageContext.FailureDescription] = deadLetterErrorDescription
+            };
+
+            if (!string.IsNullOrWhiteSpace(_options.DeadLetterQueuePath))
+            {
+                // DEAD-LETTER queue configured: explicit republish (SSB-style) to it, authoritative over any
+                // broker-side DLX, publisher-confirmed BEFORE the original is acked. Reports Settled and leaves
+                // WritesToErrorQueue false, so the core ALSO runs its error-recovery action (ErrorQueueDispatcher →
+                // IForwardMessages) to forward a copy to ErrorQueueName when both queues are configured.
+                // The delivered native Expiration is DROPPED on the deadletter hop: a dead-letter queue is for
+                // inspection, so a dead-lettered message must NOT auto-expire via the original per-message TTL.
+                return await RepublishThenAckAsync(received, _options.DeadLetterQueuePath, headerOverrides, preserveExpiration: false, cancellationToken).ConfigureAwait(false);
+            }
+
+            // ERROR-ONLY config (no dead-letter queue): republish-confirmed to the error queue THEN epoch-guarded
+            // ack, so loss-safety is guaranteed on this path the same way it is on the DLQ path. The outcome is the
+            // TRUTHFUL one — this path DID settle the delivery — and the duplicate error-queue write is suppressed
+            // by the SEPARATE WritesToErrorQueue control signal declared above, never by misreporting the outcome.
+            // The neither-configured misconfiguration is rejected at InitializeAsync's startup gate, so this branch
+            // only runs for the legitimate error-only config.
+            return await RepublishThenAckAsync(received, _options.ErrorQueuePath, headerOverrides, preserveExpiration: false, cancellationToken).ConfigureAwait(false);
+        }
+
+        // INVARIANT: the republish (confirms-enabled publish channel) MUST complete before the original delivery
+        // is acked, so a fault between them leaves the original un-acked and the broker redelivers it. The ack is
+        // epoch-guarded; if the receive channel was recycled the ack is a no-op and the broker redelivers — the
+        // republished copy is then the duplicate absorbed downstream.
+        private async Task<SettlementResult> RepublishThenAckAsync(ReceivedMessage received,
+                                                                   string destination,
+                                                                   IReadOnlyDictionary<string, object> headerOverrides,
+                                                                   bool preserveExpiration,
+                                                                   CancellationToken cancellationToken)
+        {
+            await using var rental = await _connectionSource.AcquirePublishChannelAsync(cancellationToken).ConfigureAwait(false);
+
+            // REPUBLISH boundary: route through the SINGLE translation contract so no hop rebuilds BasicProperties
+            // independently. The carried facts (every delivered native, including the C-family — DECISION-B) and the
+            // merged header overrides are re-emitted exactly like a fresh publish; preserveExpiration is the only
+            // per-hop difference (true on nack-redelivery, false on deadletter).
+            var properties = RabbitMqMessageTranslator.ToRepublishAmqp(
+                FactsFrom(received),
+                received.Headers,
+                new RabbitMqMessageTranslator.RepublishOptions(preserveExpiration, headerOverrides));
+
+            // Default-exchange convention: routing key == destination queue name.
+            await rental.Channel.BasicPublishAsync(exchange: string.Empty,
+                                                   routingKey: destination,
+                                                   mandatory: true,
+                                                   basicProperties: properties,
+                                                   body: new ReadOnlyMemory<byte>(received.Body),
+                                                   cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            return await SettleOnReceiveChannelAsync(received, (channel) =>
+                channel.BasicAckAsync(received.DeliveryTag, multiple: false, cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+
+        // Projects the curated native AMQP properties carried on a buffered ReceivedMessage back into the
+        // translator's NativeFacts carrier, so the receive translation (ToCore) and the republish translation
+        // (ToRepublishAmqp) consume the SAME native-property shape the single capture point (CaptureFacts) produced.
+        private static RabbitMqMessageTranslator.NativeFacts FactsFrom(ReceivedMessage received)
+            => new RabbitMqMessageTranslator.NativeFacts(
+                messageId: received.MessageId,
+                expiration: received.Expiration,
+                priority: received.Priority,
+                timestamp: received.Timestamp,
+                type: received.Type,
+                appId: received.AppId,
+                contentEncoding: received.ContentEncoding,
+                contentType: received.ContentType,
+                correlationId: received.CorrelationId);
+
+        // INVARIANT: runs the settlement under the receive-channel gate and compares the delivery's carried epoch
+        // to the current channel epoch. On a mismatch the channel was recycled since delivery — the delivery tag
+        // is meaningless on the new channel and the broker has already redelivered — so the settlement does not
+        // happen and is reported Failed.
+        private Task<SettlementResult> SettleOnReceiveChannelAsync(ReceivedMessage received,
+                                                                   Func<IChannel, ValueTask> settle,
+                                                                   CancellationToken cancellationToken)
+        {
+            return _connectionSource.RunOnReceiveChannelAsync(async (channel, currentEpoch) =>
+            {
+                if (received.ChannelEpoch != currentEpoch)
+                {
+                    _logger.LogTrace("Skipping settlement of delivery tag {deliveryTag}: carried epoch {carriedEpoch} no longer matches current channel epoch {currentEpoch}; broker will redeliver.",
+                        received.DeliveryTag, received.ChannelEpoch, currentEpoch);
+                    // The settlement was ATTEMPTED and did not happen, so it is Failed — not NotRequired. The
+                    // delivery tag is meaningless on the recycled channel and the broker redelivers the original,
+                    // so the receiver reports a failed receive and does not retry the settlement.
+                    return SettlementResult.Failed(
+                        $"the receive channel was recycled since delivery: delivery tag {received.DeliveryTag} carries epoch {received.ChannelEpoch}, which no longer matches the current channel epoch {currentEpoch}");
+                }
+
+                await settle(channel).ConfigureAwait(false);
+                return SettlementResult.Settled();
+            }, cancellationToken);
+        }
+
+        // Normalize the untrusted incoming x-chatter-delivery-count the same way ResolveReceiveAttempts does
+        // before incrementing it back onto the republished copy, so a hostile negative/oversized header cannot
+        // poison the counter we stamp (which would otherwise let the message dodge or distort deadlettering).
+        private IReadOnlyDictionary<string, object> BuildClassicRedeliveryHeaders(ReceivedMessage received)
+        {
+            var current = SaturateToNonNegativeInt(ReadHeaderAsLong(received.Headers, RabbitMqMessageContext.DeliveryCountHeader, 0L));
+            var next = current == int.MaxValue ? int.MaxValue : current + 1;
+            return new Dictionary<string, object>
+            {
+                [RabbitMqMessageContext.DeliveryCountHeader] = (long)next
+            };
+        }
+
+        // AMQP integer headers arrive boxed as int/long/short/byte; a string-typed header arrives as a byte[].
+        // Read the delivery-count header tolerantly so both the native x-delivery-count and the adapter's
+        // x-chatter-delivery-count resolve to a long regardless of which boxed numeric type the client produced.
+        private static long ReadHeaderAsLong(IReadOnlyDictionary<string, object> headers, string key, long defaultValue)
+        {
+            if (headers == null || !headers.TryGetValue(key, out var raw) || raw == null)
+            {
+                return defaultValue;
+            }
+
+            switch (raw)
+            {
+                case long asLong:
+                    return asLong;
+                case int asInt:
+                    return asInt;
+                case short asShort:
+                    return asShort;
+                case byte asByte:
+                    return asByte;
+                case uint asUInt:
+                    return asUInt;
+                case ushort asUShort:
+                    return asUShort;
+                case byte[] asBytes when long.TryParse(System.Text.Encoding.UTF8.GetString(asBytes), out var parsed):
+                    return parsed;
+                case string asString when long.TryParse(asString, out var parsed):
+                    return parsed;
+                default:
+                    return defaultValue;
+            }
+        }
+
+        private static bool TryGetReceivedMessage(MessageBrokerContext context, out ReceivedMessage received)
+        {
+            received = null;
+            return context?.Container.TryGet(out received) ?? false;
+        }
+
+        // TransactionMode.None ⇒ at-most-once: an error after receive loses the message. The core stamps the
+        // effective mode onto the TransactionContext it passes to every settlement call, so the receiver reads it
+        // here rather than capturing it at construction. ReceiveOnly / FullAtomicityViaInfrastructure (the latter
+        // rejected at startup) both keep the retry+deadletter path.
+        private static bool IsAtMostOnce(TransactionContext transactionContext)
+            => transactionContext?.TransactionMode == TransactionMode.None;
+
+        // INVARIANT (TERMINAL receive teardown, mirrors core BrokeredMessageReceiver.StopReceiver — one-way, not
+        // restartable): stop receiving and complete the buffer through StopReceivingAndCompleteBufferAsync, which
+        // owns the stop-then-complete ORDERING and its #494 known gap.
+        // SURGICAL: StopReceivingAsync leaves the connection + publish pool intact (the singleton source is shared
+        // with the sender, which keeps publishing). Prefetched-but-unacked deliveries are NOT acked here — they are
+        // left for broker redelivery, consistent with the epoch guard that already no-ops a settle after the channel
+        // is torn down. A delivery that buffered after the cancel but before completion is drained by the reader.
+        public Task StopReceiver()
+            => StopReceivingAndCompleteBufferAsync();
+
+        // Cancel the AMQP consumer on the SHARED source FIRST so no new delivery can race the buffer completion (the
+        // source's StopReceivingAsync cancels the consumer and tears down the receive channel under its gate), THEN
+        // complete the buffer writer so the blocking ReceiveMessageAsync pull drains and unblocks.
+        // INVARIANT (the parked reader is NEVER stranded): the completion runs in a finally, so a stop that THROWS
+        // still unblocks the pull. IRabbitMqConnectionSource is a PUBLIC seam and a consumer-supplied source may
+        // fault its stop for any reason; without the finally that fault skipped the completion, left
+        // ReceiveMessageAsync parked on the empty buffer forever, and HUNG HOST SHUTDOWN. There is deliberately NO
+        // catch: a foreign source's contract violation must still surface to the caller — it simply can no longer
+        // strand the reader.
+        // WHY ONE HELPER RATHER THAN THREE COPIES: StopReceiver, Dispose and DisposeAsync previously each held these
+        // same two bare statements, and that sameness was cosmetic — three copies of two statements carried no rule
+        // to get wrong. The finally changes the calculus: the duplication now carries a CORRECTNESS INVARIANT, and
+        // "every teardown path remembers its finally" maintained by convention is exactly the complete-the-known-set
+        // shape this adapter has been removing. One helper makes it structural instead of conventional.
+        // KNOWN GAP (issue #494): a BufferDeliveryAsync write ALREADY PARKED on a full bounded buffer is not
+        // quiesced by this sequence. Cancelling the consumer stops NEW pushes but does not un-park that write, and
+        // TryComplete() then faults it with ChannelClosedException. Under autoAck:true — TransactionMode.None only —
+        // the broker removed that delivery as it pushed it, so there is no redelivery and the message is LOST. Every
+        // other mode keeps manual ack, so the unacked delivery is redelivered. The ordering above is deliberate and
+        // #494 tracks the quiesce; do not reorder the stop and the completion to chase it.
+        private async Task StopReceivingAndCompleteBufferAsync()
+        {
+            try
+            {
+                await _connectionSource.StopReceivingAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                _buffer?.Writer.TryComplete();
+            }
+        }
+
+        // CreateLocalTransaction returns null to match the core default; full-atomicity transaction handling is
+        // rejected at startup in STEP-006 (FullAtomicityViaInfrastructure is unsupported on this adapter).
+        public TransactionScope CreateLocalTransaction(TransactionContext context)
+            => null;
+
+        // INVARIANT (dispose NEVER tears down the shared source): disposing THIS receiver means releasing what THIS
+        // receiver holds — its AMQP consumer and the receive channel — which is exactly the surgical teardown
+        // StopReceiver performs. The IRabbitMqConnectionSource is a SINGLETON the SENDER shares: its connection and
+        // publish-channel pool outlive any one receiver, and the DI container disposes the singleton at host shutdown.
+        // This is not merely a stray-scope concern — the core's BrokeredMessageReceiver.StartReceiver returns the
+        // infrastructure receiver itself as the IAsyncDisposable its hosted service await-usings, so this path runs on
+        // EVERY receiver shutdown. Disposing the source here closed the connection and drained the publish pool
+        // underneath hosted services that stop later and are still publishing, faulting their sends with
+        // ObjectDisposedException. The sibling ASB adapter disposes only its OWN inner receiver, never the shared
+        // ServiceBusClient; this matches it.
+        // Dispose, DisposeAsync and StopReceiver therefore run the SAME helper unconditionally —
+        // StopReceivingAndCompleteBufferAsync, which stops then completes the buffer in a finally.
+        // StopReceivingAsync is gate-serialized and idempotent, so stop-then-dispose and double-dispose are
+        // clean no-ops, and a stop issued when nothing was ever registered finds no delegate and no consumer tag to
+        // cancel. Terminal either way: a disposed receiver does not restart.
+        public void Dispose()
+        {
+            // Blocking on the async stop is deliberate and safe here: the connection source awaits with
+            // ConfigureAwait(false) throughout, so there is no captured context to deadlock against, and the core
+            // sets the same precedent in its own Dispose(bool). In production the receiver is always disposed through
+            // DisposeAsync (the core's path), so this path exists only for a synchronous container teardown.
+            StopReceivingAndCompleteBufferAsync().GetAwaiter().GetResult();
+        }
+
+        public async ValueTask DisposeAsync()
+            => await StopReceivingAndCompleteBufferAsync().ConfigureAwait(false);
+    }
+}

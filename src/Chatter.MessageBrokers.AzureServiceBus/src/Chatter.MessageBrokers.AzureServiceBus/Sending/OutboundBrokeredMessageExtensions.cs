@@ -1,0 +1,108 @@
+﻿using Chatter.MessageBrokers.AzureServiceBus.Extensions;
+using Chatter.MessageBrokers.Sending;
+using Azure.Messaging.ServiceBus;
+using System;
+
+namespace Chatter.MessageBrokers.AzureServiceBus.Sending
+{
+    public static class OutboundBrokeredMessageExtensions
+    {
+        public static ServiceBusMessage AsAzureServiceBusMessage(this OutboundBrokeredMessage brokeredMessage)
+        {
+            var message = new ServiceBusMessage(BinaryData.FromBytes(brokeredMessage.Body))
+            {
+                MessageId = string.IsNullOrWhiteSpace(brokeredMessage.MessageId) ? Guid.NewGuid().ToString() : brokeredMessage.MessageId,
+                CorrelationId = brokeredMessage.CorrelationId,
+                ContentType = brokeredMessage.ContentType,
+                Subject = brokeredMessage.GetSubject(),
+                ReplyTo = brokeredMessage.GetReplyToAddress(),
+                ReplyToSessionId = brokeredMessage.GetReplyToGroupId(),
+                SessionId = brokeredMessage.GetGroupId(),
+                TransactionPartitionKey = brokeredMessage.GetViaPartitionKey(),
+                To = brokeredMessage.GetToAddress()
+            }
+            .WithApplicationProperties(brokeredMessage.MessageContext);
+
+            // An absent partition key means "not specified" here, not "explicitly null": the SDK's
+            // set_PartitionKey rejects any value that differs from an already-set SessionId -- including
+            // null and empty string -- so a SessionId-bearing message only assigns PartitionKey when a
+            // non-empty value was actually supplied, letting SessionId stand in for it otherwise (an
+            // explicit non-empty mismatch between the two must still throw). Without a SessionId there is
+            // no mismatch to guard against, so an explicitly supplied empty string is preserved as-is
+            // rather than folded into "absent" -- otherwise a caller who deliberately passed
+            // string.Empty would silently observe null on the outgoing message instead.
+            var groupId = brokeredMessage.GetGroupId();
+            if (string.IsNullOrEmpty(groupId))
+            {
+                if (brokeredMessage.MessageContext.ContainsKey(ASBMessageContext.PartitionKey))
+                {
+                    message.PartitionKey = brokeredMessage.GetPartitionKey();
+                }
+            }
+            else if (!string.IsNullOrEmpty(brokeredMessage.GetPartitionKey()))
+            {
+                message.PartitionKey = brokeredMessage.GetPartitionKey();
+            }
+
+            if (brokeredMessage.GetTimeToLive() != null)
+            {
+                message.TimeToLive = brokeredMessage.GetTimeToLive().Value;
+            }
+
+            if (brokeredMessage.GetScheduledEnqueueTimeUtc() != null)
+            {
+                message.ScheduledEnqueueTime = brokeredMessage.GetScheduledEnqueueTimeUtc().Value;
+            }
+
+            return message;
+        }
+
+        public static OutboundBrokeredMessage WithScheduledEnqueueTimeUtc(this OutboundBrokeredMessage outboundBrokeredMessage, DateTime scheduledEnqueueTimeUtc)
+        {
+            outboundBrokeredMessage.MessageContext[ASBMessageContext.ScheduledEnqueueTimeUtc] = scheduledEnqueueTimeUtc;
+            return outboundBrokeredMessage;
+        }
+
+        public static DateTime? GetScheduledEnqueueTimeUtc(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.TryGetMessageContextByKey<DateTime>(ASBMessageContext.ScheduledEnqueueTimeUtc, out var scheduledEnqueueTimeUtc) ? scheduledEnqueueTimeUtc : (DateTime?)null;
+
+        public static OutboundBrokeredMessage WithTo(this OutboundBrokeredMessage outboundBrokeredMessage, string to)
+        {
+            outboundBrokeredMessage.MessageContext[ASBMessageContext.To] = to;
+            return outboundBrokeredMessage;
+        }
+
+        public static string GetToAddress(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(ASBMessageContext.To);
+
+        public static OutboundBrokeredMessage WithViaPartitionKey(this OutboundBrokeredMessage outboundBrokeredMessage, string viaPartitionKey)
+        {
+            outboundBrokeredMessage.MessageContext[ASBMessageContext.ViaPartitionKey] = viaPartitionKey;
+            return outboundBrokeredMessage;
+        }
+
+        public static string GetViaPartitionKey(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(ASBMessageContext.ViaPartitionKey);
+
+        public static OutboundBrokeredMessage WithPartitionKey(this OutboundBrokeredMessage outboundBrokeredMessage, string partitionKey)
+        {
+            outboundBrokeredMessage.MessageContext[ASBMessageContext.PartitionKey] = partitionKey;
+            return outboundBrokeredMessage;
+        }
+
+        public static string GetPartitionKey(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(ASBMessageContext.PartitionKey);
+        public static string GetReplyToAddress(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(MessageContext.ReplyToAddress);
+        public static string GetReplyToGroupId(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(MessageContext.ReplyToGroupId);
+        public static string GetGroupId(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(MessageContext.GroupId);
+        public static string GetSubject(this OutboundBrokeredMessage outboundBrokeredMessage) => outboundBrokeredMessage.GetMessageContextByKey<string>(MessageContext.Subject);
+
+        public static object GetApplicationPropertyByKey(this OutboundBrokeredMessage outboundBrokeredMessage, string key)
+        {
+            if (outboundBrokeredMessage.MessageContext.TryGetValue(key, out var output))
+            {
+                return output;
+            }
+            else
+            {
+                return null;
+            }
+        }
+    }
+}

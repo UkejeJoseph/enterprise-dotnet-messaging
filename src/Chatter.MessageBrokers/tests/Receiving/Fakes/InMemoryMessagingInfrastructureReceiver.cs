@@ -1,0 +1,450 @@
+using Chatter.MessageBrokers.Context;
+using Chatter.MessageBrokers.Receiving;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Transactions;
+
+namespace Chatter.MessageBrokers.Tests.Receiving.Fakes
+{
+    /// <summary>
+    /// In-memory test double for <see cref="IMessagingInfrastructureReceiver"/>.
+    /// Enqueue <see cref="MessageBrokerContext"/> instances via <see cref="Enqueue"/> before
+    /// starting the receiver loop; the double drains them in order and signals
+    /// <see cref="Drained"/> when the last message has been returned.
+    /// </summary>
+    public sealed class InMemoryMessagingInfrastructureReceiver : IMessagingInfrastructureReceiver, IDeliveryReleaseSignal
+    {
+        private readonly ConcurrentQueue<MessageBrokerContext> _messageQueue = new ConcurrentQueue<MessageBrokerContext>();
+        private readonly List<ReceiverCall> _callLog = new List<ReceiverCall>();
+        private readonly TaskCompletionSource<bool> _drainedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly int _expectedMessageCount;
+        private int _deliveryCount;
+        private int _receiveCallCount;
+        private bool _disposed;
+
+        // INVARIANT: optional opt-in gate that holds InitializeAsync until released, making the receiver's Starting
+        // lifecycle window (after the SUT assigns _infrastructureReceiver, before go-live) observable to a test. Default
+        // null so the many existing tests that construct this fake are unaffected; only the startup-window test sets it.
+        private TaskCompletionSource<bool> _initializeGate;
+
+        // INVARIANT: optional opt-in latch that makes the FIRST infra teardown call (StopReceiver or DisposeAsync) throw
+        // exactly once, then behave normally on subsequent calls. Lets the fault-resettable-retry test force the first
+        // quiesce body to throw and assert a later teardown re-runs cleanup. Default 0 (disarmed) so existing tests are
+        // unaffected; armed via ArmThrowOnceOnTeardown.
+        private int _throwOnceOnTeardownArmed;
+
+        // INVARIANT: optional opt-in hook that makes the FIRST DisposeAsync call park on a test-releasable gate, then throw
+        // exactly once after the gate is released; subsequent DisposeAsync calls behave normally (record Dispose). Lets the
+        // residual-escalation-race test deterministically PARK the first in-flight DisposeAsync open long enough for a
+        // concurrent teardown to reach the escalation short-circuit, then release so the parked DisposeAsync throws once.
+        // StopReceiver is NEVER affected by this hook. Default DISARMED (null fields) so all existing tests and the
+        // existing ArmThrowOnceOnTeardown / ThrowOnceIfArmed paths are byte-unchanged; armed via ArmGateThenThrowOnceOnDisposeAsync.
+        // INVARIANT: optional opt-in fault that makes EVERY AckMessageAsync call raise it. Lets a test drive the
+        // handling-succeeded-then-acknowledgement-failed case, in which the fault is swallowed into a bool by the
+        // receiver's settle path and therefore never leaves the worker's processing block. Default null (disarmed) so
+        // existing tests are unaffected; armed via ArmAckFailure.
+        private Exception _ackFailure;
+
+        // INVARIANT: optional opt-in outcome that EVERY AckMessageAsync call returns in place of the default Settled.
+        // Lets a test drive each of the three settlement outcomes through the receiver's ladder, in particular the
+        // Failed the infrastructure ANSWERS with rather than raises — the case an undeclared bool return could not
+        // tell apart from NotRequired. Default null (disarmed) so existing tests are unaffected; armed via
+        // ArmAckOutcome.
+        private SettlementResult? _ackOutcome;
+
+        // INVARIANT: optional opt-in local transaction. CreateLocalTransaction returns null by default, so the
+        // receiver's `localTransaction?.Complete()` is a no-op and no test pays for an ambient transaction it does
+        // not assert on. When armed, a real TransactionScope is created and its final status is captured from the
+        // ambient Transaction's completion callback — NOT read back from the Transaction afterwards, which throws
+        // ObjectDisposedException once the scope has been disposed. Whether the receiver COMMITTED it is what
+        // distinguishes a settled delivery from one the infrastructure declined or never needed to settle. Armed via
+        // ArmLocalTransaction.
+        private const int UnsetTransactionStatus = -1;
+        private bool _localTransactionArmed;
+        private int _localTransactionStatus = UnsetTransactionStatus;
+
+        // INVARIANT: optional opt-in gate that holds DeliveryReleased — the receiver's delivery-release signal —
+        // inside the hook until ReleaseDeliveryReleasedGate is called, plus an entry-signal the test awaits. Parks the
+        // worker AFTER the settlement answer but BEFORE the concurrency slot is returned, which is the window that
+        // makes the hook's ORDERING observable without a wall-clock sleep. Default null (disarmed) so existing tests
+        // are unaffected; armed via ArmDeliveryReleasedGate.
+        private TaskCompletionSource<bool> _deliveryReleasedGate;
+        private TaskCompletionSource<bool> _deliveryReleasedGateEntered;
+
+        // INVARIANT: optional opt-in fault that makes EVERY DeliveryReleased call raise it after recording the call,
+        // so a test can drive a capability that violates the must-not-throw contract. Default null (disarmed) so
+        // existing tests are unaffected; armed via ArmDeliveryReleasedFailure.
+        private Exception _deliveryReleasedFailure;
+
+        private TaskCompletionSource<bool> _disposeAsyncGate;
+        private TaskCompletionSource<bool> _disposeAsyncGateEntered;
+        private int _gateThenThrowOnceOnDisposeArmed;
+
+        /// <param name="expectedMessageCount">
+        /// Number of messages the test will enqueue; <see cref="Drained"/> completes after this
+        /// many <see cref="ReceiveMessageAsync"/> calls return a non-null context.
+        /// </param>
+        public InMemoryMessagingInfrastructureReceiver(int expectedMessageCount)
+        {
+            if (expectedMessageCount < 0)
+                throw new ArgumentOutOfRangeException(nameof(expectedMessageCount));
+            _expectedMessageCount = expectedMessageCount;
+            _deliveryCount = 1;
+
+            // INVARIANT: if zero messages are expected the queue is already drained.
+            if (_expectedMessageCount == 0)
+                _drainedTcs.TrySetResult(true);
+        }
+
+        // ------------------------------------------------------------------ public test API
+
+        /// <summary>
+        /// Ordered log of calls made by the receiver loop. Returns a locked snapshot so test-thread
+        /// reads never touch the backing <see cref="List{T}"/> while the loop is mutating it under
+        /// <see cref="RecordCall"/>'s lock (<see cref="List{T}"/> is not safe for concurrent read/write).
+        /// </summary>
+        public IReadOnlyList<ReceiverCall> CallLog
+        {
+            get
+            {
+                lock (_callLog)
+                    return _callLog.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Completes when <see cref="ReceiveMessageAsync"/> has returned the configured number
+        /// of non-null contexts. Tests await this instead of sleeping.
+        /// </summary>
+        public Task Drained => _drainedTcs.Task;
+
+        /// <summary>
+        /// Sets the value returned by <see cref="MessageDeliveryCountAsync"/> for every call.
+        /// Default is 1.
+        /// </summary>
+        public int DeliveryCount
+        {
+            get => _deliveryCount;
+            set => _deliveryCount = value;
+        }
+
+        /// <summary>
+        /// Whether this double reports that the infrastructure owns the Error Queue write, implicitly implementing
+        /// <see cref="IMessagingInfrastructureReceiver.WritesToErrorQueue"/>.
+        /// </summary>
+        /// <remarks>
+        /// INVARIANT: optional opt-in arming hook, default DISARMED (<c>false</c>) — the SAME value the default
+        /// interface member declares — so every existing test that constructs this double is behaviourally unchanged.
+        /// Only a test pinning the receiver's max-attempts suppression gate arms it to <c>true</c>.
+        /// </remarks>
+        public bool WritesToErrorQueue { get; set; }
+
+        /// <summary>Enqueues a message to be returned by the next <see cref="ReceiveMessageAsync"/> call.</summary>
+        public void Enqueue(MessageBrokerContext context)
+        {
+            if (context is null) throw new ArgumentNullException(nameof(context));
+            _messageQueue.Enqueue(context);
+        }
+
+        /// <summary>
+        /// Arms an opt-in gate that holds <see cref="InitializeAsync"/> until <see cref="ReleaseInitializeGate"/> is
+        /// called, so a test can pin the receiver in its Starting lifecycle window (infra receiver assigned, not yet
+        /// live) and exercise a teardown landing there. Records <see cref="ReceiverCall.Initialize"/> on entry as usual.
+        /// </summary>
+        public Task ArmInitializeGate()
+        {
+            _initializeGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            return _initializeGate.Task;
+        }
+
+        /// <summary>Releases the gate armed by <see cref="ArmInitializeGate"/> so <see cref="InitializeAsync"/> returns.</summary>
+        public void ReleaseInitializeGate() => _initializeGate?.TrySetResult(true);
+
+        /// <summary>
+        /// Arms a one-shot latch so the FIRST <see cref="StopReceiver"/> or <see cref="DisposeAsync"/> call throws an
+        /// <see cref="InvalidOperationException"/>, then subsequent teardown calls behave normally. Used to drive the
+        /// fault-resettable-retry path: the first quiesce body faults and a later teardown must re-run and dispose.
+        /// </summary>
+        public void ArmThrowOnceOnTeardown() => Interlocked.Exchange(ref _throwOnceOnTeardownArmed, 1);
+
+        /// <summary>
+        /// Arms <see cref="AckMessageAsync"/> to raise <paramref name="ackFailure"/> on every call, after recording
+        /// the call, so a test can exercise a delivery whose handling succeeded and whose acknowledgement then failed.
+        /// </summary>
+        public void ArmAckFailure(Exception ackFailure) => _ackFailure = ackFailure ?? throw new ArgumentNullException(nameof(ackFailure));
+
+        /// <summary>
+        /// Arms <see cref="AckMessageAsync"/> to RETURN <paramref name="ackOutcome"/> on every call instead of the
+        /// default <see cref="SettlementResult.Settled"/>, so a test can drive an outcome the infrastructure answers
+        /// with rather than one it raises. <see cref="ArmAckFailure"/> takes precedence when both are armed, because
+        /// a call that throws never returns a value.
+        /// </summary>
+        public void ArmAckOutcome(SettlementResult ackOutcome) => _ackOutcome = ackOutcome;
+
+        /// <summary>
+        /// Arms <see cref="CreateLocalTransaction"/> to return a real <see cref="TransactionScope"/> whose final
+        /// status <see cref="LocalTransactionStatus"/> reports. Async flow is enabled because the receiver awaits
+        /// inside the scope and disposes it from a continuation.
+        /// </summary>
+        public void ArmLocalTransaction() => _localTransactionArmed = true;
+
+        /// <summary>
+        /// The status of the local transaction armed by <see cref="ArmLocalTransaction"/>:
+        /// <see cref="TransactionStatus.Committed"/> once the receiver completed it,
+        /// <see cref="TransactionStatus.Aborted"/> once the scope was disposed without completion, or <c>null</c>
+        /// when no local transaction was ever created.
+        /// </summary>
+        /// <remarks>Written from the transaction's own completion callback on the worker's thread and read from the
+        /// test's thread, so both sides go through <see cref="Volatile"/>.</remarks>
+        public TransactionStatus? LocalTransactionStatus
+        {
+            get
+            {
+                var status = Volatile.Read(ref _localTransactionStatus);
+                return status == UnsetTransactionStatus ? (TransactionStatus?)null : (TransactionStatus)status;
+            }
+        }
+
+        /// <summary>
+        /// Arms a one-shot hook so the FIRST <see cref="DisposeAsync"/> call (a) awaits a test-releasable gate, then
+        /// (b) throws an <see cref="InvalidOperationException"/> exactly once; subsequent <see cref="DisposeAsync"/> calls
+        /// behave normally (record <see cref="ReceiverCall.Dispose"/>). <see cref="StopReceiver"/> is never affected.
+        /// Returns the gate handle; the test releases it via <see cref="ReleaseDisposeAsyncGate"/> once a concurrent
+        /// teardown has reached the escalation short-circuit, making the residual-race interleave deterministic.
+        /// </summary>
+        public void ArmGateThenThrowOnceOnDisposeAsync()
+        {
+            _disposeAsyncGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _disposeAsyncGateEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Interlocked.Exchange(ref _gateThenThrowOnceOnDisposeArmed, 1);
+        }
+
+        /// <summary>
+        /// Completes when the FIRST armed <see cref="DisposeAsync"/> has parked on the gate. The test awaits this to
+        /// sequence a concurrent teardown deterministically (no wall-clock sleep) before releasing via
+        /// <see cref="ReleaseDisposeAsyncGate"/>.
+        /// </summary>
+        public Task DisposeAsyncGateEntered => _disposeAsyncGateEntered?.Task ?? Task.CompletedTask;
+
+        /// <summary>Releases the gate armed by <see cref="ArmGateThenThrowOnceOnDisposeAsync"/> so the parked first DisposeAsync proceeds to throw once.</summary>
+        public void ReleaseDisposeAsyncGate() => _disposeAsyncGate?.TrySetResult(true);
+
+        /// <summary>
+        /// Arms an opt-in gate that holds <see cref="DeliveryReleased"/> inside the hook until
+        /// <see cref="ReleaseDeliveryReleasedGate"/> is called, pinning the worker after the delivery's settlement
+        /// answer and before its concurrency slot is returned. Returns the entry-signal the test awaits so the
+        /// interleave is wall-clock-free: it completes once <see cref="DeliveryReleased"/> has been ENTERED.
+        /// </summary>
+        public Task ArmDeliveryReleasedGate()
+        {
+            _deliveryReleasedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _deliveryReleasedGateEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            return _deliveryReleasedGateEntered.Task;
+        }
+
+        /// <summary>Releases the gate armed by <see cref="ArmDeliveryReleasedGate"/> so the parked hook returns.</summary>
+        public void ReleaseDeliveryReleasedGate() => _deliveryReleasedGate?.TrySetResult(true);
+
+        /// <summary>
+        /// Arms <see cref="DeliveryReleased"/> to raise <paramref name="deliveryReleasedFailure"/> on every call, after
+        /// recording the call, so a test can exercise a capability that throws where the contract forbids it.
+        /// </summary>
+        public void ArmDeliveryReleasedFailure(Exception deliveryReleasedFailure)
+            => _deliveryReleasedFailure = deliveryReleasedFailure ?? throw new ArgumentNullException(nameof(deliveryReleasedFailure));
+
+        // ------------------------------------------------------------------ IMessagingInfrastructureReceiver
+
+        public async Task InitializeAsync(ReceiverOptions options, CancellationToken cancellationToken)
+        {
+            RecordCall(ReceiverCall.Initialize);
+
+            // When a test arms the gate, hold here — the SUT has already assigned _infrastructureReceiver and advanced to
+            // the Starting lifecycle state but has not reached go-live, so the test can observe and tear down that window.
+            var gate = _initializeGate;
+            if (gate != null)
+            {
+                await gate.Task.ConfigureAwait(false);
+            }
+        }
+
+        public async Task<MessageBrokerContext> ReceiveMessageAsync(TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_messageQueue.TryDequeue(out var context))
+            {
+                RecordCall(ReceiverCall.Receive);
+
+                int callCount = Interlocked.Increment(ref _receiveCallCount);
+                if (callCount >= _expectedMessageCount)
+                    _drainedTcs.TrySetResult(true);
+
+                return context;
+            }
+
+            // Queue empty: block until cancellation instead of returning null synchronously.
+            // Returning null here would let the receiver loop spin-call back into this method,
+            // pegging CPU and growing CallLog unbounded while the test winds down. Awaiting the
+            // token parks the loop until cts.Cancel(), at which point the OCE unwinds it cleanly.
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            return null; // unreachable: the await above always throws on cancellation.
+        }
+
+        public Task<SettlementResult> AckMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            // The call is RECORDED BEFORE the arming check, so a test waiting on ReceiverCall.Ack still unblocks when
+            // the acknowledgement is armed to fail. That mirrors the real infrastructures: the settle call was made,
+            // it just did not succeed.
+            RecordCall(ReceiverCall.Ack);
+
+            if (_ackFailure != null)
+            {
+                return Task.FromException<SettlementResult>(_ackFailure);
+            }
+
+            return Task.FromResult(_ackOutcome ?? SettlementResult.Settled());
+        }
+
+        public Task<SettlementResult> NackMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, CancellationToken cancellationToken)
+        {
+            RecordCall(ReceiverCall.Nack);
+            return Task.FromResult(SettlementResult.Settled());
+        }
+
+        public Task<SettlementResult> DeadletterMessageAsync(MessageBrokerContext context, TransactionContext transactionContext, string deadLetterReason, string deadLetterErrorDescription, CancellationToken cancellationToken)
+        {
+            RecordCall(ReceiverCall.Deadletter);
+            return Task.FromResult(SettlementResult.Settled());
+        }
+
+        public Task StopReceiver()
+        {
+            ThrowOnceIfArmed();
+            RecordCall(ReceiverCall.Stop);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Returns <see cref="DeliveryCount"/> for every call, bypassing the default-impl read of MessageContext.</summary>
+        public Task<int> MessageDeliveryCountAsync(MessageBrokerContext context, CancellationToken cancellationToken)
+            => Task.FromResult(_deliveryCount);
+
+        /// <summary>
+        /// Returns null so the loop's <c>localTransaction?.Complete()</c> is a no-op, unless
+        /// <see cref="ArmLocalTransaction"/> armed a real scope whose completion a test asserts on.
+        /// </summary>
+        public TransactionScope CreateLocalTransaction(TransactionContext context)
+        {
+            if (!_localTransactionArmed)
+            {
+                return null;
+            }
+
+            var scope = new TransactionScope(TransactionScopeOption.RequiresNew, TransactionScopeAsyncFlowOption.Enabled);
+            Transaction.Current.TransactionCompleted += RecordLocalTransactionStatus;
+            return scope;
+        }
+
+        // ------------------------------------------------------------------ IDeliveryReleaseSignal
+
+        /// <summary>
+        /// Records <see cref="ReceiverCall.DeliveryReleased"/>, then honours whichever opt-in hook is armed: the gate
+        /// parks the caller INSIDE the hook until the test releases it, and the failure raises after the call has been
+        /// recorded. Disarmed by default, so the hook is a pure call-log entry for every existing test.
+        /// </summary>
+        public void DeliveryReleased(MessageBrokerContext context)
+        {
+            RecordCall(ReceiverCall.DeliveryReleased);
+
+            // Signal entry BEFORE blocking so the awaiting test observes the hook has been entered; block via
+            // GetAwaiter().GetResult() because the hook is void, matching the provider fake's GetReceiver gate idiom.
+            var gate = _deliveryReleasedGate;
+            if (gate != null)
+            {
+                _deliveryReleasedGateEntered?.TrySetResult(true);
+                gate.Task.GetAwaiter().GetResult();
+            }
+
+            if (_deliveryReleasedFailure != null)
+            {
+                throw _deliveryReleasedFailure;
+            }
+        }
+
+        // ------------------------------------------------------------------ IAsyncDisposable / IDisposable
+
+        public async ValueTask DisposeAsync()
+        {
+            // INVARIANT: when the gate-then-throw-once hook is armed, the FIRST DisposeAsync claims the one-shot atomically,
+            // parks on the test-releasable gate (so a concurrent teardown can reach the escalation short-circuit while this
+            // dispose is in flight), then throws exactly once after release. Subsequent DisposeAsync calls fall through to
+            // the normal record path. Disarm via Interlocked.Exchange so exactly one call is parked-and-thrown even under a
+            // concurrent teardown race. Default DISARMED, so the normal path below is byte-identical to before.
+            if (Interlocked.Exchange(ref _gateThenThrowOnceOnDisposeArmed, 0) == 1)
+            {
+                _disposeAsyncGateEntered?.TrySetResult(true);
+
+                var gate = _disposeAsyncGate;
+                if (gate != null)
+                {
+                    await gate.Task.ConfigureAwait(false);
+                }
+
+                throw new InvalidOperationException("Simulated in-flight DisposeAsync failure (gate-then-throw-once).");
+            }
+
+            ThrowOnceIfArmed();
+            RecordCallOnce(ReceiverCall.Dispose);
+        }
+
+        public void Dispose()
+        {
+            RecordCallOnce(ReceiverCall.Dispose);
+        }
+
+        // ------------------------------------------------------------------ helpers
+
+        // INVARIANT: if the throw-once latch is armed, atomically disarm it and throw on this single call; otherwise no-op.
+        // Interlocked.Exchange makes exactly one teardown call throw even under a concurrent teardown race.
+        private void ThrowOnceIfArmed()
+        {
+            if (Interlocked.Exchange(ref _throwOnceOnTeardownArmed, 0) == 1)
+            {
+                throw new InvalidOperationException("Simulated infrastructure teardown failure (throw-once).");
+            }
+        }
+
+        // The status is captured HERE, inside the completion callback, because the Transaction is disposed with its
+        // scope and reading TransactionInformation afterwards throws ObjectDisposedException.
+        private void RecordLocalTransactionStatus(object sender, TransactionEventArgs completion)
+            => Volatile.Write(ref _localTransactionStatus, (int)completion.Transaction.TransactionInformation.Status);
+
+        private void RecordCall(ReceiverCall call)
+        {
+            lock (_callLog)
+                _callLog.Add(call);
+        }
+
+        private void RecordCallOnce(ReceiverCall call)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            RecordCall(call);
+        }
+    }
+
+    /// <summary>Identifies a method call on <see cref="InMemoryMessagingInfrastructureReceiver"/>.</summary>
+    public enum ReceiverCall
+    {
+        Initialize,
+        Receive,
+        Ack,
+        Nack,
+        Deadletter,
+        Stop,
+        Dispose,
+        DeliveryReleased
+    }
+}

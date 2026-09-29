@@ -1,0 +1,135 @@
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+
+namespace Chatter.MessageBrokers.Receiving
+{
+    /// <summary>
+    /// The message received by the <see cref="BrokeredMessageReceiverBackgroundService{TMessage}"/>
+    /// </summary>
+    public class InboundBrokeredMessage
+    {
+        internal IDictionary<string, object> MessageContextImpl { get; }
+
+        internal InboundBrokeredMessage(string messageId, byte[] body, IDictionary<string, object> messageContext, string messageReceiverPath, IBrokeredMessageBodyConverter bodyConverter)
+        {
+            MessageId = messageId;
+            Body = body;
+            MessageContextImpl = messageContext ?? new ConcurrentDictionary<string, object>();
+            MessageReceiverPath = messageReceiverPath;
+            BodyConverter = bodyConverter ?? new JsonBodyConverter();
+            CorrelationId = GetMessageContextByKey<string>(MessageBrokers.MessageContext.CorrelationId);
+            MessageContextImpl[MessageBrokers.MessageContext.ContentType] = bodyConverter.ContentType;
+        }
+
+        /// <summary>
+        /// The message id of the received message
+        /// </summary>
+        public string MessageId { get; }
+        /// <summary>
+        /// The body of the received message
+        /// </summary>
+        public byte[] Body { get; }
+        /// <summary>
+        /// The application properties of the received message
+        /// </summary>
+        public IReadOnlyDictionary<string, object> MessageContext => (IReadOnlyDictionary<string, object>)MessageContextImpl;
+        /// <summary>
+        /// The name of the message receiver that recieved this message
+        /// </summary>
+        public string MessageReceiverPath { get; }
+        /// <summary>
+        /// The correlation id of the received message
+        /// </summary>
+        public string CorrelationId { get; }
+        /// <summary>
+        /// True if the inbound message has encountered an error while being received
+        /// </summary>
+        public bool IsError => GetMessageContextByKey<bool>(MessageBrokers.MessageContext.IsError);
+        /// <summary>
+        /// True if the inbound message has not encountered an error while being received
+        /// </summary>
+        public bool IsSuccess => !IsError;
+        /// <summary>
+        /// The receivers visited by the inbound message prior to the most recent message receiver
+        /// </summary>
+        public string Via => GetMessageContextByKey<string>(MessageBrokers.MessageContext.Via);
+
+        /// <summary>
+        /// Gets a message of type <typeparamref name="TBody"/> from the message body
+        /// </summary>
+        /// <typeparam name="TBody">The type of the object stored as the message body</typeparam>
+        /// <returns>The strongly typed message payload</returns>
+        public TBody GetMessageFromBody<TBody>()
+            => this.BodyConverter.Convert<TBody>(this.Body);
+
+        public InboundBrokeredMessage UseMessagingInfrastructure(Func<InfrastructureTypes, string> infrastructureSelector)
+        {
+            MessageContextImpl[MessageBrokers.MessageContext.InfrastructureType] = infrastructureSelector(new InfrastructureTypes());
+            return this;
+        }
+
+        internal IBrokeredMessageBodyConverter BodyConverter { get; }
+
+        internal InboundBrokeredMessage UpdateVia(string via)
+        {
+            var key = MessageBrokers.MessageContext.Via;
+            // INVARIANT: a stored 'via' whose kind is not string reads as absent, so the receiver being
+            // visited REPLACES it rather than appending to a value of another kind. Oracle:
+            // WhenMutatingMessageContext.MustReplaceViaWhenStoredValueIsNotAString, which goes red the moment
+            // GetMessageContextByKey<T> casts with `(T)output` instead of kind-testing with `output is T typedOutput`.
+            var currentVia = GetMessageContextByKey<string>(key);
+            if (currentVia != null)
+            {
+                if (!(string.IsNullOrWhiteSpace(via)))
+                {
+                    MessageContextImpl[key] = currentVia + "," + via;
+                }
+            }
+            else
+            {
+                MessageContextImpl[key] = via;
+            }
+            return this;
+        }
+
+        private T GetMessageContextByKey<T>(string key)
+        {
+            // INVARIANT: application properties arrive off the wire and carry no type guarantee, so a value
+            // of an unexpected type is read as absent rather than faulting the receive with an invalid cast.
+            if (MessageContextImpl.TryGetValue(key, out var output))
+            {
+                return output is T typedOutput ? typedOutput : default;
+            }
+            else
+            {
+                return default;
+            }
+        }
+
+        internal InboundBrokeredMessage WithFailureDetails(string failureDetails)
+        {
+            MessageContextImpl[MessageBrokers.MessageContext.FailureDetails] = failureDetails;
+            return this;
+        }
+
+        internal InboundBrokeredMessage WithFailureDescription(string failureDescription)
+        {
+            MessageContextImpl[MessageBrokers.MessageContext.FailureDescription] = failureDescription;
+            return this;
+        }
+
+        internal InboundBrokeredMessage ClearReplyToProperties()
+        {
+            MessageContextImpl.Remove(MessageBrokers.MessageContext.ReplyToAddress);
+            MessageContextImpl.Remove(MessageBrokers.MessageContext.ReplyToGroupId);
+            return this;
+        }
+
+        internal InboundBrokeredMessage WithRouteToSelfPath(string destinationPath)
+        {
+            MessageContextImpl[MessageBrokers.MessageContext.RouteToSelfPath] = destinationPath;
+            return this;
+        }
+    }
+}

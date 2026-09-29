@@ -1,0 +1,149 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.2] - 2026-09-28
+
+### Fixed
+
+- **A quorum-queue message whose handler kept failing was redelivered indefinitely and never dead-lettered, on RabbitMQ 4.3 and later.** From RabbitMQ 4.3, a `basic.nack` with requeue no longer advances the queue's native `x-delivery-count`, so the receiver's attempt count never rose and `maxReceiveAttempts` was never reached. The receiver now returns a failed delivery with `basic.reject` and requeue instead, which RabbitMQ counts as a failed delivery attempt on every supported version. When `maxReceiveAttempts` is kept below the queue's `delivery-limit` (20 by default from RabbitMQ 4.0), the message is dead-lettered once `maxReceiveAttempts` is hit (to the Dead-letter Queue when one is configured, otherwise the Error Queue); at or above it, RabbitMQ can drop the message or dead-letter it through the queue's DLX first. No configuration or API change, and no behavior change on RabbitMQ before 4.3 or on classic queues, which already counted redeliveries through their own header. The earlier advice to use classic queues on RabbitMQ 4.3 and later no longer applies — see [Quorum queues](https://github.com/brenpike/Chatter/blob/master/src/Chatter.MessageBrokers.RabbitMQ/src/README.md#quorum-queues). (#533)
+- **The native quorum counters `x-delivery-count` and `x-acquired-count` are now consumed when a delivery is received, not carried onto anything downstream.** They are stripped before `ReceivedMessage` is built, so `ReceivedMessage.Headers` never contains them, and they are never copied onto messages sent while handling a delivery or onto the message republished to the Dead-letter Queue, the Error Queue, or a classic redelivery. `MessageContext.ReceiveAttempts` is unaffected. (#533)
+
+## [0.6.1] - 2026-09-24
+
+### Changed
+
+- Dependency lock file refreshed for Scrutor 7.0.0, which arrives through Chatter.CQRS. No code change (#394).
+
+## [0.6.0] - 2026-09-24
+
+### Removed
+
+- **`net8.0` is no longer a target framework. The package now targets `net10.0` only.** .NET 8 reaches end of support on 2026-11-10 and gets no security patches after that, so shipping a `net8.0` build would advertise support that cannot be delivered. **This is a breaking change** for any consumer still building against `net8.0`. They are not stranded: the last multi-targeting release stays installable on NuGet, but they get no newer versions of this package until they move to .NET 10 (#395).
+
+## [0.5.1] - 2026-09-23
+
+### Changed
+
+- **Comments on `RabbitMqHeaderMarshaller` are corrected to name the core's `DateTime` kind test on `MessageContext.ExpiryTimeUtc` instead of a `(DateTime?)` cast that no longer exists, after `Chatter.MessageBrokers` 0.34.0 changed `OutboundBrokeredMessage.RefreshTimeToLive` to read `ExpiryTimeUtc` via `TryGetMessageContextByKey<DateTime>` rather than a cast.** This carries no code change and no user-facing effect, and satisfies no formal SemVer trigger. It ships as its own release because this repository's version-check gate is path-based and cannot distinguish a comment edit from a behavioural one. See `docs/adr/0036-a-message-context-read-tests-the-persisted-kind-rather-than-casting-it.md` (#418).
+
+## [0.5.0] - 2026-09-15
+
+### Added
+
+- `UseTls` and `TlsServerName` on `RabbitMqOptions`, and `WithTls(serverName)` on `RabbitMqOptionsBuilder` — TLS for the discrete host/credential connection path. Default-off and discrete-path only: an `amqps://` connection URI already enabled TLS and continues to take precedence, and requesting TLS alongside a plaintext URI now fails at `Build()` instead of silently connecting in the clear. No certificate-validation-disabling surface is offered — the discrete path validates **strictly**, which is stricter than the client's own `amqps` URI handling (that relaxes `AcceptablePolicyErrors` to tolerate a certificate name mismatch). (#369)
+
+### Changed
+
+- A receiver configured with a dead-letter or error queue that does not exist on the broker now **fails at startup**, naming the missing queue, instead of starting and then stalling forever on the first poison message (the deadletter republish previously faulted silently, leaving the original delivery unsettled and its broker credit exhausted). The module still provisions no topology — it passively verifies existence and never declares. Migration, in two parts:
+  1. Declare the queue externally before the application starts, or correct the configured name.
+  2. **New broker-permission requirement.** On RabbitMQ 4.3.1 and later a passive declare requires the connecting user to hold **at least one** of `configure`, `write`, or `read` on the target queue (any one is sufficient — unlike a non-passive declare, which specifically requires `configure`). This adapter had no `queue.declare` of any kind before, so a least-privilege user whose permission patterns match none of the poison-destination names could previously deadletter successfully — a poison republish goes through the default exchange and is authorised against the *exchange*, not the destination queue — and will now be refused at startup. Grant that user any one of the three permissions on each configured dead-letter and error queue name. The refusal surfaces as `ACCESS_REFUSED` and propagates unwrapped, so it is distinguishable from the missing-queue failure; brokers older than 4.3.1 require no permission for a passive declare and are unaffected. (#366)
+- **BREAKING:** An `IRabbitMqConnectionSource` you register yourself as a pre-built instance (`services.AddSingleton<IRabbitMqConnectionSource>(mySource)`) is no longer disposed by Chatter. The receiver's dispose used to escalate to the source's full teardown, which incidentally tore down a caller-supplied instance too; it no longer touches the source's lifetime at all. The built-in registration is unaffected — `AddRabbitMq` registers the source by implementation type, so the container creates it and the root provider disposes it at shutdown. Migration: dispose your instance yourself when the host stops, or register it by type or factory (`AddSingleton<IRabbitMqConnectionSource, MySource>()`, `AddSingleton<IRabbitMqConnectionSource>(sp => ...)`) so the container owns it — `Microsoft.Extensions.DependencyInjection` disposes only the instances it constructed and never a registered instance, whatever its lifetime. (#367)
+- **BREAKING:** A custom `IRabbitMqConnectionSource` registered as `Scoped` or `Transient` is now rejected by `AddRabbitMq` with a `NotSupportedException` naming the offending lifetime, where it previously registered cleanly. It could not have worked: `AddRabbitMq` preserves a source you registered yourself, but the receiver is now constructed from the **root** provider (see the entry below), so a non-singleton override either fails the first `IMessagingInfrastructure` resolution under the host's default scope validation with "Cannot resolve scoped service from root provider", or — with validation off — is captured by the root for the application's lifetime, silently defeating the per-scope lifetime that was asked for. Failing at registration replaces both outcomes with one message at the point of the mistake. Migration: register the override as a singleton (`AddSingleton<IRabbitMqConnectionSource, MySource>()`), which is the only lifetime consistent with RabbitMQ's one-`IConnection`-per-process invariant. Singleton overrides are unaffected. The lifetime that is read is the **effective** registration — the last descriptor for `IRabbitMqConnectionSource`, the one `Microsoft.Extensions.DependencyInjection` actually resolves — so a singleton registered after an earlier scoped registration is accepted, and a scoped registration added after an earlier singleton is rejected. (#367)
+- **BREAKING:** `RabbitMqReceiver` is no longer registered in the service collection by `AddRabbitMq`, and can no longer be resolved from any scope — a consumer calling `GetRequiredService<RabbitMqReceiver>()` now throws where it previously resolved. `RabbitMqReceiver` is also no longer a public type. This is the same fix as the entry above, taken to its root: a receiver instance obtained from an unrelated scope could reach the shared connection source's receive-side teardown and stop the real consumer, so rather than guard every instance the instance category is removed — there is now exactly one receiver per process, constructed where it is used. The type was never a supported extension point (it is `sealed` with no substitution hook); consumers should use the core `IMessagingInfrastructure` / `IMessagingInfrastructureReceiver` seam. (#367)
+
+### Fixed
+
+- Disposing a `RabbitMqReceiver` no longer tears down the process-singleton connection source, on either path that reaches it. A receiver resolved from an unrelated consumer scope (a health check, an injection into a request-scoped service) no longer closes the AMQP connection and drains the sender's publish channel pool when that scope ends; and host shutdown no longer closes them either, which it previously did as soon as the receiver's hosted service stopped — faulting the sends of any hosted service that stops later and is still publishing with `ObjectDisposedException`. Dispose now performs the same surgical stop as `StopReceiver` (cancel this receiver's consumer, tear down the receive channel, complete the delivery buffer) and leaves the connection, the publish pool and the source's lifetime to whoever created the source. (#367)
+
+- The `TransactionMode.FullAtomicityViaInfrastructure` and single-receiver startup guards in `AddRabbitMq` now read the **effective** `MessageBrokerOptions` and `IDiscoveredReceiverRegistry` registration — the last one registered, which is the one `Microsoft.Extensions.DependencyInjection` actually resolves — instead of the first-registered descriptor. An application with duplicate registrations of either type no longer has a guard silently skipped against a stale descriptor, or a valid configuration rejected against one. These guards shipped in 0.1.0; the acceptance boundary moving is consumer-visible for any application with such a duplicate registration.
+
+- Stopping or disposing a RabbitMQ receiver is now **terminal even when the broker misbehaves**. If the consumer-cancel failed or timed out, the teardown previously aborted part-way: the receive channel and the consumer registration were left in place, so a later automatic connection recovery could re-register a consumer on a receiver that had already been stopped — contradicting the documented one-way, non-restartable stop — and the delivery buffer was left uncompleted, which parked the core's blocking receive pull forever and **hung host shutdown**. The stop now commits its terminal state before it touches the broker at all, so the consumer-cancel and the channel dispose are best-effort and no longer throw out of `StopReceiver`, `Dispose` or `DisposeAsync`; buffer completion runs in a `finally` on all three paths, so even a faulting custom `IRabbitMqConnectionSource` unblocks the pull instead of stranding it. No configuration change is required.
+
+## [0.4.4] - 2026-09-14
+
+### Changed
+
+- `RabbitMqBodyConverter` now serializes and deserializes through `Chatter.MessageBrokers`'s public `ChatterJson.Serialize`/`ChatterJson.Deserialize` methods instead of reaching into the internal `ChatterJson.Options` field directly. Output is byte-identical and there is no behaviour change for consumers of this package.
+- Bundled dependency uplift to Chatter.MessageBrokers 0.31.0 (an in-repo `ProjectReference`, so the pack-time package dependency moves with it). This uplift must be taken together with this release: `Chatter.MessageBrokers` 0.31.0 removes the internal grant this package previously used to reach `ChatterJson.Options`, so an older `Chatter.MessageBrokers.RabbitMQ` binary composed against `Chatter.MessageBrokers` 0.31.0 or later would fail at runtime. Republishing this package with a `Chatter.MessageBrokers` >= 0.31.0 floor closes that gap.
+
+## [0.4.3] - 2026-09-13
+
+### Changed
+
+- `AddRabbitMq` registers `RabbitMqBodyConverter` as `Singleton` where it was `Scoped`, matching the process-lifetime `IBodyConverterFactory` in `Chatter.MessageBrokers` 0.30.0. With a `Scoped` converter the singleton factory becomes a captive dependency: resolving it throws `InvalidOperationException` wherever scope validation is enabled, which is the default in the Development environment. `Chatter.MessageBrokers.RabbitMQ` and `Chatter.MessageBrokers` must be upgraded together. (#342)
+- Bundled dependency uplift to Chatter.MessageBrokers 0.30.0 (an in-repo `ProjectReference`, so the pack-time package dependency moves with it).
+
+## [0.4.2] - 2026-09-11
+
+### Changed
+
+- Bundled dependency uplift to Chatter.MessageBrokers 0.29.0 (an in-repo `ProjectReference`, so the pack-time package dependency moves with it). No adapter code changed in this release: the only edits under `src/` correct code comments that described how the core reads an inbound header value, which is now a type test yielding a default rather than a hard cast. Adapter behaviour does not move with the uplift — `RabbitMqReceiver` already stamped `MessageContext.ReceiveAttempts` as an `int` on every delivery, which the core's widened delivery-count probe reads exactly as the previous one did.
+
+## [0.4.1] - 2026-09-02
+
+### Changed
+
+- Bundled dependency uplift to Chatter.MessageBrokers 0.18.0 (an in-repo `ProjectReference`, so the pack-time package dependency moves with it).
+
+## [0.4.0] - 2026-09-01
+
+### Added
+
+- Published packages now ship a symbol package (`.snupkg`), an embedded `README`, a project URL, and are built deterministically. Package builds are now reproducible CI builds with SourceLink-resolvable sources, so a debugger can step into this package's original source from a consuming application.
+
+### Changed
+
+- Bundled dependency uplift to Chatter.MessageBrokers 0.17.0 (an in-repo `ProjectReference`, so the pack-time package dependency moves with it).
+
+## [0.3.0] - 2026-08-30
+
+### Changed
+
+- **BREAKING:** `RabbitMqReceiver`'s settlement members (`AckMessageAsync`, `NackMessageAsync`, `DeadletterMessageAsync`) now return `Task<SettlementResult>` instead of `Task<bool>`, in step with the `Chatter.MessageBrokers` 0.16.0 seam. A custom caller depending on the prior `bool` return must migrate to read `SettlementResult.IsSettled`/`.Outcome`. Both deadletter branches (dead-letter-queue-configured and error-only) are otherwise unchanged (#283).
+- A settlement whose delivery arrived on a receive channel that has since been recycled (AMQP connection auto-recovery with the delivery in flight) is now reported as a FAILED settlement instead of being indistinguishable from "nothing to settle". Previously the epoch-mismatch skip returned the same `false` a genuine no-op settlement returned; it now returns `SettlementResult.Failed`, so error-rate metrics and receive spans surface these recovery events, which were previously invisible (#283).
+
+## [0.2.0] - 2026-06-13
+
+### Added
+
+- `SendOptions.WithRabbitMqRouting(exchange, routingKey)` / `PublishOptions.WithRabbitMqRouting(exchange, routingKey)` — expose the non-default exchange / routing-key override on the documented `context.RabbitMq().Send/Publish(...)` handler path (previously reachable only via manual header stamping or the explicit-outbound `OutboundBrokeredMessage` overload). (#200)
+
+## [0.1.2] - 2026-06-13
+
+### Fixed
+
+- `MessageContext.ExpiryTimeUtc` (a `DateTime` core key) was encoded to an ISO-8601 string outbound but never rehydrated on receive — it stayed a `byte[]`/`string` from the wire — so after a self-published round trip `OutboundBrokeredMessage.RefreshTimeToLive()`'s `(DateTime?)` cast on it threw `InvalidCastException` (the same class as the prior `CorrelationId` `byte[]` cast bug, here for a non-string CLR type). Fixed by replacing the marshaller's one-directional string-typed-key set with a per-descriptor **symmetric** encode/decode coercion table keyed by core context key: each known header key now declares both its CLR→wire encode and its wire→original-CLR decode, so any non-string core key routed through a header rehydrates to its original CLR type by construction (ExpiryTimeUtc decodes `byte[]`/`string`→`DateTime`; a malformed value drops the key so the core's null-guard short-circuits). The ten existing string-typed routing/failure keys are unchanged. A non-string header key can no longer be added with an encode but no matching decode, closing the asymmetry class on ADR 0004's translation contract.
+
+## [0.1.1] - 2026-06-13
+
+### Changed
+
+- Type-aware AMQP header marshalling for the RabbitMQ adapter via a single `RabbitMqHeaderMarshaller` boundary used by publish, receive, and the nack/deadletter republish, replacing the raw context↔header-table copy at every site so an uncoerced value can no longer cross the wire boundary in either direction. Two concrete defects this closes: (1) `OutboundBrokeredMessage.WithTimeToLive` stamps `MessageContext.TimeToLive` as a `TimeSpan`, which the RabbitMQ.Client 7.2.1 field table cannot encode — it threw at publish and the native `BasicProperties.Expiration` was never set; the marshaller now lifts the TimeToLive onto the native `Expiration` (milliseconds) and drops the key from the table. (2) A real broker delivers a string application header as an AMQP longstr (`byte[]`); the core casts a fixed set of string-typed context keys (e.g. `MessageContext.CorrelationId`) straight to `string`, so a self-published round-trip left `CorrelationId` as a `byte[]` and threw `InvalidCastException` before the handler ran — the marshaller now decodes the documented known-string-typed core keys back to `string` on receive while preserving every unknown key verbatim, so genuine binary headers are never corrupted and the numeric delivery-count path is untouched.
+
+### Fixed
+
+- Lifecycle-authority collapse for `RabbitMqConnectionSource` (ADR 0003): the source's liveness is now a single monotonic authority (`Live` → `Disposing` → `Disposed`) advanced only by an atomic compare-and-swap, replacing the former standalone `_disposed` flag that each mutual-exclusion domain read independently. The `IConnection` is now created and disposed under the SAME gate, so connection creation and disposal are mutually exclusive by construction (the dedicated connection-init gate is removed). A publish-or-surrender handoff makes an operation suspended mid-connection/channel-creation across a completing `DisposeAsync` surrender the just-created resource (dispose it and throw `ObjectDisposedException`) instead of resurrecting it onto a torn-down source — closing the connection-lifecycle-disposal race as a class rather than per site. The ADR 0002 receive-channel epoch lifecycle, publisher-confirm settlement, multi-receiver guard, and publish-permit conservation are preserved unchanged.
+- `DeadletterMessageAsync` now fails fast when a receiver is registered with neither a dead-letter (`ReceiverOptions.DeadLetterQueuePath`) nor an error (`ReceiverOptions.ErrorQueuePath`) path. Previously the resolved `destination` was null/blank, and the deadletter republish used it as the default-exchange routing key with `mandatory: true`, so the publish was unroutable and only faulted after the message exhausted its retry budget — leaving the original delivery un-acked and redelivered indefinitely (a poison-message hot loop). The receiver now throws an actionable `InvalidOperationException` naming the receiver queue instead of attempting the unroutable publish. Cites reviewer thread r3407616994.
+- Outbound TTL and the advertised content type are now sourced from the core's authoritative `OutboundBrokeredMessage` accessors rather than re-interpreted from the raw `MessageContext` in the marshaller / sender, closing a class of representation-drift defects. (1) The marshaller's TimeToLive lift matched only `MessageContext.TimeToLive is TimeSpan`, so an outbox-replayed context — which materializes TimeToLive as a string — was missed and the native `Expiration` was never set; the sender now lifts `Expiration` from `OutboundBrokeredMessage.GetTimeToLive()` (tolerant of a live `TimeSpan` AND the string form), and the marshaller unconditionally drops the un-encodable `TimeToLive` key in any form. (2) `BuildProperties` advertised the sender's resolved `_bodyConverter.ContentType` instead of the content type the core actually stamped on the context (`MessageContext.ContentType`) when it serialized the body, so a replayed message could be mislabelled; the sender now advertises the stamped content type, falling back to the resolved converter only when the stamp is absent. Cites reviewer threads r3407587282 and r3407587284.
+- A redelivered classic-queue message lost its per-message TTL because the nack-redelivery republish rebuilt `BasicProperties` from scratch (Persistent + MessageId + marshalled headers) and dropped every delivered native AMQP property, including the native `Expiration`. The class was broader than TTL: any delivered native property was lost on republish. Fixed by capturing the curated native AMQP property set (`Expiration`, `Priority`, `Timestamp`, `Type`, `AppId`, `ContentEncoding`, `ContentType`, `CorrelationId`) onto `ReceivedMessage` at delivery time (via the inbound `IReadOnlyBasicProperties` `Is*Present()` guards, so an absent property stays null rather than a spurious default) and re-applying them on every republish hop through ONE shared `BuildRepublishProperties` builder that all republish sites route through — so no hop can drop a native property by rebuilding from scratch. The deadletter hop intentionally drops `Expiration` (a dead-letter queue is for inspection, so a dead-lettered message must not auto-expire via the original TTL) while carrying every other native property; the nack-redelivery hop preserves `Expiration`. Cites reviewer thread r3407577438.
+- Dispose-coordination hardening for `RabbitMqConnectionSource`: every receive-gated and publish-permit entrypoint now observes `_disposed` on BOTH sides of gate/permit acquisition via a single coordination primitive. A gated receive operation queued behind `DisposeAsync` no longer resurrects a connection/channel or overwrites the stored consumer registration past teardown — it throws `ObjectDisposedException`. The publish permit is now ALWAYS released on return, so a publish acquire stranded behind a saturated pool at disposal is woken and throws rather than hanging forever.
+
+## [0.1.0] - 2026-06-12
+
+### Added
+
+- Initial `Chatter.MessageBrokers.RabbitMQ` adapter module targeting `net8.0` and `net10.0`: independently-versioned NuGet package wired into `Chatter.sln` with its own test project.
+- `RabbitMqReceiver` — `IMessagingInfrastructureReceiver` implementation; bridges RabbitMQ's push-consumer model to the core's blocking-pull loop via a bounded `Channel<T>` buffer (no busy-polling). Serializes ack/nack/deadletter on a single gated receive channel; guards every acknowledgement with a channel-epoch stamped onto each delivery. The receive channel runs with connection auto-recovery enabled but topology recovery disabled: on every automatic recovery the connection source recreates the receive channel, bumps the epoch, and re-registers the consumer under the gate as one atomic event, so a delivery's stamped epoch always equals the session that delivered it — a pre-recovery in-flight delivery's stale-epoch settle is a no-op and the broker redelivers it (no false-ack), while a post-recovery delivery carries the current epoch and settles normally (no duplicate-redelivery loop). The receiver also does not stamp the broker-supplied inbound delivery exchange / routing key onto the message context, so a handler that receives-then-sends is never silently re-routed back to the originating exchange.
+- **Quorum delivery-count strategy** (default): reads the native `x-delivery-count` header RabbitMQ increments per redelivery; stamps `MessageContext.ReceiveAttempts` for the core's Max Receives Exceeded check.
+- **Classic delivery-count strategy**: header-stamped republish counter (`x-chatter-delivery-count`) for queues where quorum is not available; publisher-confirmed before the original is acknowledged. Trade-offs documented in ADR 0001 (rare duplicate on crash-between-republish-and-ack; loss of head-of-queue ordering).
+- `RabbitMqSender` — `IMessagingInfrastructureDispatcher` implementation; publishes via the **default-exchange convention** (routing key = destination queue name) or an explicit exchange/routing-key override carried in message context. Publisher confirms enabled: a publish is only treated as sent once the broker confirms it.
+- `.WithRabbitMqRouting(exchange, routingKey)` extension on `OutboundBrokeredMessage` — stamps an explicit exchange and routing key into the message context, overriding the default-exchange convention at dispatch time.
+- Dead-letter / error routing: adapter-owned republish to the attribute-declared `DeadletterQueueName` / `ErrorQueueName` path once Max Receives Exceeded trips, then acknowledges the original (authoritative over any broker-side DLX configuration).
+- `AddRabbitMq(this IChatterBuilder, Action<RabbitMqOptionsBuilder>)` DI extension — single registration entry point; wires receiver, sender, path builder, body converter, retry/circuit-breaker predicate providers, and `IMessagingInfrastructure` under the RabbitMQ type discriminator.
+- `RabbitMqOptionsBuilder` — fluent builder for connection (`WithUri`, `WithHostName`, `WithCredentials`), prefetch (`WithPrefetch`), queue type (`WithQueueType`), message body type (`WithMessageBodyType` / `WithJsonBodyType`), and per-receiver registration (`AddQueueReceiver<TMessage>`).
+- `TransactionMode.None` and `TransactionMode.ReceiveOnly` supported; `TransactionMode.FullAtomicityViaInfrastructure` rejected at startup with a message directing users to the Outbox.
+- `context.RabbitMq()` context selector extension — stamps outbound messages for RabbitMQ infrastructure dispatch.
+- `InfrastructureTypes.RabbitMq()` extension — returns the RabbitMQ infrastructure type discriminator string.
+- `RabbitMqRetryExceptionPredicatesProvider` and `RabbitMqCircuitBreakerExceptionPredicatesProvider` — classify transient RabbitMQ faults through the shared `RetryWithCircuitBreakerStrategy` seam.
+- `IRabbitMqConnectionSource` seam — sole originator of the singleton `IConnection`, serialized receive channel (with epoch), and pooled publish channels; substituted by an in-memory double in unit tests.
+- `RabbitMqBodyConverter` — UTF-8 JSON body encoding/decoding through the shared `ChatterJson.Options`.
+- `RabbitMqPathBuilder` — resolves `SendingPath`, `ReceiverName`, `ErrorQueueName`, and `DeadletterQueueName` from `BrokeredMessageAttribute` fields.
+
+### Known Limitations
+
+- **Single RabbitMQ queue receiver per process.** 0.1.0 supports exactly one RabbitMQ queue receiver per process. Registering more than one fails fast at startup with `NotSupportedException` — the connection source owns one receive channel and one consumer registration, so a second receiver would clobber the first and recovery would re-register only the last. Full multi-receiver support is tracked in [#195](https://github.com/brenpike/Chatter/issues/195).

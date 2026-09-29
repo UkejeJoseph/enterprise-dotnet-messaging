@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <PackageId>Chatter.MessageBrokers.Reliability.Cosmos</PackageId>
+    <Version>0.9.1</Version>
+    <Authors>Brennan Pike</Authors>
+    <Owners>Brennan Pike</Owners>
+    <Description>Azure Cosmos DB reliability provider for Chatter.MessageBrokers, shipping three independently registrable primitives. Document Tier (WithCosmosDocumentReliability&lt;TCommand&gt;): a per-command opt-in in which the handler's aggregate write, its Co-Resident Outbox Document, and its Batched Inbox Marker commit on one partition-scoped TransactionalBatch; the Document-Tier Outbox Relay publishes afterwards and always reconstructs the message verbatim. Standalone Inbox Gate (WithCosmosInbox): lease-less redelivery dedup for stateless consumers via a two-phase Write-Ahead Claim confirmed on completion; it dedups redeliveries only, not concurrent delivery — two concurrent deliveries of one message id both run the handler, so handlers behind it must be idempotent and safe under concurrent execution of the same id. Standalone Outbox Relay (AddCosmosOutboxRelay): its own hosted service, independent of the command pipeline, draining pending Outbox Documents off a monitored container's change feed; it alone consults an optional Outbox Body Resolver. The Document Tier's public staging surface rejects application documents carrying the inbox:/outbox: id prefixes, while a Standalone Outbox Relay drains an application-authored trigger document only when its id is exactly outbox:{encoded(MessageId)}. Delivery is at-least-once (receivers dedup via the Inbox Marker); the monitored container must have defaultTtl enabled for delivered documents to self-purge; the application owns the CosmosClient and provisions the Cosmos resources.</Description>
+    <RepositoryUrl>https://github.com/brenpike/Chatter</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>Messaging,Message Broker,.NET Core, Cosmos DB</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IsPackable>true</IsPackable>
+    <!-- The Cosmos SDK v3 build check demands an explicit Newtonsoft.Json reference; the SDK bundles and uses
+         Newtonsoft internally, so this only disables the build-time check. Chatter deliberately carries no direct
+         Newtonsoft dependency (the relational provider migrated off it), so we bypass the check rather than re-add it. -->
+    <AzureCosmosDisableNewtonsoftJsonCheck>true</AzureCosmosDisableNewtonsoftJsonCheck>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.61.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Chatter.MessageBrokers\src\Chatter.MessageBrokers\Chatter.MessageBrokers.csproj" />
+  </ItemGroup>
+
+</Project>

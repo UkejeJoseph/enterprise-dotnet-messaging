@@ -1,0 +1,326 @@
+#nullable disable
+
+using Chatter.CQRS;
+using Chatter.MessageBrokers.Context;
+using Chatter.MessageBrokers.Receiving;
+using Chatter.MessageBrokers.Reliability;
+using Chatter.MessageBrokers.Reliability.Inbox;
+using Chatter.MessageBrokers.Reliability.Outbox;
+using Chatter.MessageBrokers.Sending;
+using Chatter.MessageBrokers.Tests.Receiving.Fakes;
+using FluentAssertions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Moq;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
+
+namespace Chatter.MessageBrokers.Tests.DependencyInjection.UsingChatterMessageBrokerExtensions
+{
+    /// <summary>
+    /// Verifies the cast-at-consumption reliability model: <see cref="IPollableOutboxStore"/> and
+    /// <see cref="IInboxDeduplicator"/> are NOT independent DI registrations. Each is obtained by
+    /// casting the single resolved primary (<see cref="IBrokeredMessageOutbox"/> /
+    /// <see cref="IBrokeredMessageInbox"/>) at the consumption site, exactly as
+    /// <see cref="OutboxProcessor"/> casts to <see cref="IUnitOfWork"/>. Split-store is impossible
+    /// by construction: there is exactly one resolved instance per pair.
+    ///
+    /// INVARIANT: all cases resolve facets within a single <see cref="IServiceScope"/> because the fact under test is
+    /// facet-cast identity, not store lifetime. Cross-scope sharing is a SEPARATE fact with its own oracle,
+    /// <see cref="WhenSharingReliabilityStoresAcrossScopes"/>, and for the shipped in-memory defaults it IS a defect
+    /// when it fails: their whole state lives in the instance while every consumer opens a fresh scope per operation.
+    /// </summary>
+    public class WhenResolvingReliabilityStores : Testing.Core.Context
+    {
+        // ------------------------------------------------------------------ fakes
+
+        private sealed class CustomOutboxBoth : IBrokeredMessageOutbox, IPollableOutboxStore
+        {
+            public Task SendToOutbox(IEnumerable<OutboundBrokeredMessage> outboundBrokeredMessages, TransactionContext transactionContext, CancellationToken cancellationToken = default)
+                => Task.CompletedTask;
+
+            public Task<IEnumerable<OutboxMessage>> GetUnprocessedMessagesFromOutbox(CancellationToken cancellationToken = default)
+                => Task.FromResult<IEnumerable<OutboxMessage>>(Array.Empty<OutboxMessage>());
+
+            public Task UpdateProcessedDate(IEnumerable<OutboxMessage> outboxMessages, CancellationToken cancellationToken = default)
+                => Task.CompletedTask;
+
+            public Task UpdateProcessedDate(OutboxMessage outboxMessage, CancellationToken cancellationToken = default)
+                => Task.CompletedTask;
+
+            public Task<IEnumerable<OutboxMessage>> GetUnprocessedBatch(Guid batchId, CancellationToken cancellationToken = default)
+                => Task.FromResult<IEnumerable<OutboxMessage>>(Array.Empty<OutboxMessage>());
+        }
+
+        // Implements ONLY IBrokeredMessageOutbox — casting to IPollableOutboxStore must throw.
+        private sealed class CustomOutboxPrimaryOnly : IBrokeredMessageOutbox
+        {
+            public Task SendToOutbox(IEnumerable<OutboundBrokeredMessage> outboundBrokeredMessages, TransactionContext transactionContext, CancellationToken cancellationToken = default)
+                => Task.CompletedTask;
+        }
+
+        private sealed class CustomInboxBoth : IBrokeredMessageInbox, IInboxDeduplicator
+        {
+            public Task ReceiveViaInbox<TMessage>(TMessage message, IMessageBrokerContext messageBrokerContext, Func<Task> messageReceiver)
+                => messageReceiver();
+
+            public Task<bool> HasBeenReceived(string messageId, CancellationToken cancellationToken = default)
+                => Task.FromResult(false);
+        }
+
+        // Implements ONLY IBrokeredMessageInbox — casting to IInboxDeduplicator must throw.
+        private sealed class CustomInboxPrimaryOnly : IBrokeredMessageInbox
+        {
+            public Task ReceiveViaInbox<TMessage>(TMessage message, IMessageBrokerContext messageBrokerContext, Func<Task> messageReceiver)
+                => messageReceiver();
+        }
+
+        // ------------------------------------------------------------------ infrastructure
+
+        private static readonly System.Reflection.Assembly NoBrokeredMessageAssembly = typeof(IMessage).Assembly;
+
+        // Builds the Chatter DI graph with an optional pre-registration action that runs before
+        // AddMessageBrokers so callers can register custom implementations to test the override seams.
+        private static IServiceScope BuildScope(Action<IServiceCollection> preRegister = null)
+        {
+            var configuration = new ConfigurationBuilder().Build();
+            var services = new ServiceCollection();
+
+            services.AddLogging();
+            services.AddSingleton<IMessagingInfrastructure>(BuildInMemoryInfrastructure());
+
+            preRegister?.Invoke(services);
+
+            services
+                .AddChatterCqrs(configuration, NoBrokeredMessageAssembly)
+                .AddMessageBrokers(
+                    optionsBuilder: null,
+                    receiverHandlerSourceBuilder: b => b.WithExplicitAssemblies(NoBrokeredMessageAssembly));
+
+            return services.BuildServiceProvider().CreateScope();
+        }
+
+        private static IMessagingInfrastructure BuildInMemoryInfrastructure()
+        {
+            // No receiver is started in these registration-only tests; the factories are mocked so
+            // no actual InMemoryMessagingInfrastructureReceiver is allocated or disposed here.
+            var dispatcherFactory = new Mock<IMessagingInfrastructureDispatcherFactory>();
+            dispatcherFactory.Setup(f => f.Create()).Returns(new Mock<IMessagingInfrastructureDispatcher>().Object);
+            var receiverFactory = new Mock<IMessagingInfrastructureReceiverFactory>();
+            receiverFactory.Setup(f => f.Create()).Returns(new Mock<IMessagingInfrastructureReceiver>().Object);
+            return new MessagingInfrastructure(
+                type: InMemoryMessagingInfrastructureProvider.InfrastructureType,
+                receiveInfrastructure: receiverFactory.Object,
+                dispatchInfrastructure: dispatcherFactory.Object);
+        }
+
+        // ------------------------------------------------------------------ outbox: default in-memory
+
+        [Fact]
+        public void OutboxDefault_ResolvesIBrokeredMessageOutboxToInMemoryInstance()
+        {
+            using var scope = BuildScope();
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+
+            outbox.Should().BeOfType<InMemoryBrokeredMessageOutbox>();
+        }
+
+        [Fact]
+        public void OutboxDefault_CastingToPollableYieldsSameInstance()
+        {
+            using var scope = BuildScope();
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+            var pollable = (IPollableOutboxStore)outbox;
+
+            ReferenceEquals(outbox, pollable).Should().BeTrue("cast must return the same instance, not a wrapper");
+        }
+
+        [Fact]
+        public void OutboxDefault_CastingToUnitOfWorkYieldsSameInstance()
+        {
+            using var scope = BuildScope();
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+            var unitOfWork = (IUnitOfWork)outbox;
+
+            ReferenceEquals(outbox, unitOfWork).Should().BeTrue("OutboxProcessor casts the resolved outbox to IUnitOfWork; the default store must satisfy that facet from the same instance, not a wrapper");
+        }
+
+        [Fact]
+        public void OutboxDefault_NoPollableOutboxStoreDescriptorRegistered()
+        {
+            using var scope = BuildScope();
+
+            // IPollableOutboxStore is NOT a DI service — it is obtained by casting the primary.
+            var pollable = scope.ServiceProvider.GetService<IPollableOutboxStore>();
+            pollable.Should().BeNull("IPollableOutboxStore must not be an independent DI registration");
+        }
+
+        // ------------------------------------------------------------------ outbox: custom primary implementing both
+
+        [Fact]
+        public void OutboxCustomPrimaryImplementingBoth_ResolvesToCustomInstance()
+        {
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxBoth>());
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+
+            outbox.Should().BeOfType<CustomOutboxBoth>();
+        }
+
+        [Fact]
+        public void OutboxCustomPrimaryImplementingBoth_CastToPollableYieldsSameInstance()
+        {
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxBoth>());
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+            var pollable = (IPollableOutboxStore)outbox;
+
+            ReferenceEquals(outbox, pollable).Should().BeTrue("cast must return the same custom instance");
+        }
+
+        // ------------------------------------------------------------------ outbox: custom primary-only (cast guard)
+
+        [Fact]
+        public void OutboxCustomPrimaryOnly_CastToPollableThrowsInvalidCastException()
+        {
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxPrimaryOnly>());
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+            Action cast = () => { var _ = (IPollableOutboxStore)outbox; };
+
+            cast.Should().Throw<InvalidCastException>("a custom primary that does not implement IPollableOutboxStore must throw at the cast site");
+        }
+
+        // ------------------------------------------------------------------ outbox: last-wins / duplicate-primary
+
+        [Fact]
+        public void OutboxDuplicatePrimary_LastWinsAndCastYieldsSameInstance()
+        {
+            // Register a custom primary before AddMessageBrokers. AddIfNotRegistered leaves the custom
+            // one in place (last-wins by descriptor order). Resolving IBrokeredMessageOutbox yields
+            // exactly the custom instance; its cast to IPollableOutboxStore must be the same object.
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxBoth>());
+            var sp = scope.ServiceProvider;
+
+            var outbox = sp.GetRequiredService<IBrokeredMessageOutbox>();
+            var pollable = (IPollableOutboxStore)outbox;
+
+            outbox.Should().BeOfType<CustomOutboxBoth>("custom primary wins when registered before AddMessageBrokers");
+            ReferenceEquals(outbox, pollable).Should().BeTrue("one instance — split unrepresentable");
+        }
+
+        // ------------------------------------------------------------------ outbox: durable attempt state
+
+        /// <summary>
+        /// A staged outbox message has never been attempted and is due now — <see cref="OutboxMessage.DispatchAttempts"/>
+        /// is zero and <see cref="OutboxMessage.NextAttemptAtUtc"/> is null, which is the DUE-NOW value. A row a store
+        /// wrote before it knew about either column therefore reads as due rather than as held back for good.
+        /// </summary>
+        [Fact]
+        public void OutboxMessage_IsNeverAttemptedAndDueNowWhenStaged()
+        {
+            var staged = new OutboxMessage();
+
+            staged.DispatchAttempts.Should().Be(0);
+            staged.NextAttemptAtUtc.Should().BeNull("null is the due-now value, so an unstamped row is never held back");
+        }
+
+        /// <summary>
+        /// <see cref="CustomOutboxBoth"/> deliberately does NOT implement <c>RecordDispatchAttempt</c>: a third-party
+        /// pollable store written against the previous interface must still compile and must still satisfy the cast.
+        /// The inherited default records nothing, so such a store keeps whatever attempt state its rows already carry
+        /// rather than being handed a half-applied one.
+        /// </summary>
+        [Fact]
+        public async Task OutboxCustomPrimaryImplementingBoth_RecordDispatchAttemptDefaultsToANoOp()
+        {
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxBoth>());
+            var pollable = (IPollableOutboxStore)scope.ServiceProvider.GetRequiredService<IBrokeredMessageOutbox>();
+            // Both attempt-state values are stated rather than defaulted, so this fact answers for the no-op alone and
+            // the staged defaults stay the business of the fact above.
+            var attempted = new OutboxMessage { MessageId = "store-that-never-heard-of-attempts", DispatchAttempts = 3, NextAttemptAtUtc = null };
+
+            await pollable.RecordDispatchAttempt(attempted, DateTime.UtcNow.AddMinutes(5));
+
+            attempted.DispatchAttempts.Should().Be(3, "the inherited default records nothing");
+            attempted.NextAttemptAtUtc.Should().BeNull("the inherited default records nothing");
+        }
+
+        /// <summary>
+        /// <see cref="CustomOutboxBoth"/> deliberately does NOT implement <c>TryClaimForDispatch</c> either, so the
+        /// inherited default is what answers. It GRANTS: a store written against the previous interface keeps
+        /// exactly today's behaviour and pays nothing for the new member. What it gives up is arbitration - every
+        /// drain is told it won - which is the honest trade, not a defect this fact is guarding against.
+        /// </summary>
+        [Fact]
+        public async Task OutboxCustomPrimaryImplementingBoth_TryClaimForDispatchGrantsByDefault()
+        {
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageOutbox, CustomOutboxBoth>());
+            var pollable = (IPollableOutboxStore)scope.ServiceProvider.GetRequiredService<IBrokeredMessageOutbox>();
+            var polled = new OutboxMessage { MessageId = "store-that-never-heard-of-the-drain-claim", NextAttemptAtUtc = null };
+
+            var claimed = await pollable.TryClaimForDispatch(polled, observedNextAttemptAtUtc: null, claimedNextAttemptAtUtc: DateTime.UtcNow.AddMinutes(5));
+
+            claimed.Should().BeTrue("the inherited default grants the drain claim");
+        }
+
+        // ------------------------------------------------------------------ inbox: default in-memory
+
+        [Fact]
+        public void InboxDefault_ResolvesIBrokeredMessageInboxToInMemoryInstance()
+        {
+            using var scope = BuildScope();
+            var sp = scope.ServiceProvider;
+
+            var inbox = sp.GetRequiredService<IBrokeredMessageInbox>();
+
+            inbox.Should().BeOfType<InMemoryBrokeredMessageInbox>();
+        }
+
+        [Fact]
+        public void InboxDefault_NoInboxDeduplicatorDescriptorRegistered()
+        {
+            using var scope = BuildScope();
+
+            // IInboxDeduplicator is NOT a DI service — it is obtained by casting the primary.
+            var dedup = scope.ServiceProvider.GetService<IInboxDeduplicator>();
+            dedup.Should().BeNull("IInboxDeduplicator must not be an independent DI registration");
+        }
+
+        // ------------------------------------------------------------------ inbox: last-wins / duplicate-primary
+
+        [Fact]
+        public void InboxDuplicatePrimary_LastWinsAndCastYieldsSameInstance()
+        {
+            // Register a custom primary before AddMessageBrokers. AddIfNotRegistered leaves the custom
+            // one in place. Resolving IBrokeredMessageInbox yields the custom instance; cast must match.
+            using var scope = BuildScope(services =>
+                services.AddScoped<IBrokeredMessageInbox, CustomInboxBoth>());
+            var sp = scope.ServiceProvider;
+
+            var inbox = sp.GetRequiredService<IBrokeredMessageInbox>();
+            var dedup = (IInboxDeduplicator)inbox;
+
+            inbox.Should().BeOfType<CustomInboxBoth>("custom primary wins when registered before AddMessageBrokers");
+            ReferenceEquals(inbox, dedup).Should().BeTrue("one instance — split unrepresentable");
+        }
+    }
+}

@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <!-- Required by ChatterJsonEncoder: JavaScriptEncoder's abstract surface (FindFirstCharacterToEncode,
+         TryEncodeUnicodeScalar) is char*-pointer based, so the overrides must be unsafe. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageId>Chatter.MessageBrokers</PackageId>
+    <Version>0.35.3</Version>
+    <Authors>Brennan Pike</Authors>
+    <Owners>Brennan Pike</Owners>
+    <Description>A message broker adapter library built on top of Chatter.CQRS.</Description>
+    <RepositoryUrl>https://github.com/brenpike/Chatter</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>Messaging,.NET,</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Chatter.CQRS\src\Chatter.CQRS\Chatter.CQRS.csproj" />
+  </ItemGroup>
+
+</Project>

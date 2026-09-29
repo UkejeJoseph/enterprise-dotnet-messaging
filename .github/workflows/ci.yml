@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            10.0.x
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+      - name: Restore
+        run: |
+          for p in \
+            'src/Chatter.CQRS/tests/Chatter.CQRS.Tests.csproj' \
+            'src/Chatter.MessageBrokers/tests/Chatter.MessageBrokers.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus.Auth/tests/Chatter.MessageBrokers.AzureServiceBus.Auth.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.EntityFramework/tests/Chatter.MessageBrokers.Reliability.EntityFramework.Tests.csproj' \
+            'src/Chatter.MessageBrokers.SqlServiceBroker/tests/Chatter.MessageBrokers.SqlServiceBroker.Tests.csproj' \
+            'src/Chatter.MessageBrokers.RabbitMQ/tests/Chatter.MessageBrokers.RabbitMQ.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.Cosmos/tests/Chatter.MessageBrokers.Reliability.Cosmos.Tests.csproj' \
+            'src/Chatter.SqlChangeFeed/tests/Chatter.SqlChangeFeed.Tests.csproj'; do
+            dotnet restore "$p" --locked-mode
+          done
+      - name: Build
+        run: |
+          for p in \
+            'src/Chatter.CQRS/tests/Chatter.CQRS.Tests.csproj' \
+            'src/Chatter.MessageBrokers/tests/Chatter.MessageBrokers.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus.Auth/tests/Chatter.MessageBrokers.AzureServiceBus.Auth.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.EntityFramework/tests/Chatter.MessageBrokers.Reliability.EntityFramework.Tests.csproj' \
+            'src/Chatter.MessageBrokers.SqlServiceBroker/tests/Chatter.MessageBrokers.SqlServiceBroker.Tests.csproj' \
+            'src/Chatter.MessageBrokers.RabbitMQ/tests/Chatter.MessageBrokers.RabbitMQ.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.Cosmos/tests/Chatter.MessageBrokers.Reliability.Cosmos.Tests.csproj' \
+            'src/Chatter.SqlChangeFeed/tests/Chatter.SqlChangeFeed.Tests.csproj'; do
+            dotnet build "$p" -c Release --no-restore
+          done
+      - name: Test
+        run: |
+          for p in \
+            'src/Chatter.CQRS/tests/Chatter.CQRS.Tests.csproj' \
+            'src/Chatter.MessageBrokers/tests/Chatter.MessageBrokers.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' \
+            'src/Chatter.MessageBrokers.AzureServiceBus.Auth/tests/Chatter.MessageBrokers.AzureServiceBus.Auth.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.EntityFramework/tests/Chatter.MessageBrokers.Reliability.EntityFramework.Tests.csproj' \
+            'src/Chatter.MessageBrokers.SqlServiceBroker/tests/Chatter.MessageBrokers.SqlServiceBroker.Tests.csproj' \
+            'src/Chatter.MessageBrokers.RabbitMQ/tests/Chatter.MessageBrokers.RabbitMQ.Tests.csproj' \
+            'src/Chatter.MessageBrokers.Reliability.Cosmos/tests/Chatter.MessageBrokers.Reliability.Cosmos.Tests.csproj' \
+            'src/Chatter.SqlChangeFeed/tests/Chatter.SqlChangeFeed.Tests.csproj'; do
+            dotnet test "$p" -c Release --no-build --filter 'Category!=Integration' /p:CollectCoverage=true
+          done
+      - name: Merge coverage report
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool --version 5.5.10
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Generate aggregate coverage
+        run: |
+          reportgenerator \
+            -reports:'artifacts/coverage/*.cobertura.xml' \
+            -targetdir:'artifacts/coverage/report' \
+            -reporttypes:'Cobertura;TextSummary;MarkdownSummaryGithub'
+          cat artifacts/coverage/report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: |
+            artifacts/coverage/report/**
+            artifacts/coverage/*.cobertura.xml
+
+  integration:
+    name: integration (docker)
+    runs-on: ubuntu-latest
+    # Consolidated lane runs ASB emulator + MSSQL sidecar, SQL Server, and RabbitMQ container
+    # stacks across net10.0 plus solution restore/build; budgeted above the old per-adapter
+    # 30-min nightly jobs to absorb cold image pulls without timeout-only PR failures.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            10.0.x
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+      # Docker is available on GitHub-hosted ubuntu runners; each Testcontainers fixture
+      # self-provisions its own container (ASB emulator + MSSQL sidecar, SQL Server, RabbitMQ).
+      - name: Restore
+        run: dotnet restore Chatter.sln --locked-mode
+      - name: Build
+        run: dotnet build Chatter.sln -c Release --no-restore
+      - name: Integration test (all adapters)
+        run: dotnet test Chatter.sln -c Release --no-build --filter 'Category=Integration'
+
+  real-namespace-integration:
+    name: integration (azureservicebus real namespace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # GitHub Actions disallows secrets.* in a job-level `if:`, so a guard step exports whether the secret
+      # is configured. Every provisioning/test step below is gated on this output, making the whole job a
+      # clean no-op (green) on forks or any repo without the secret — it never fails CI.
+      - name: Guard on real-namespace secret
+        id: guard
+        env:
+          SECRET: ${{ secrets.CHATTER_ASB_REAL_NAMESPACE_CONNECTION_STRING }}
+        run: |
+          if [ -n "$SECRET" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Setup .NET
+        if: steps.guard.outputs.configured == 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            10.0.x
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+      - name: Restore
+        if: steps.guard.outputs.configured == 'true'
+        run: dotnet restore 'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' --locked-mode
+      - name: Build
+        if: steps.guard.outputs.configured == 'true'
+        run: dotnet build 'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' -c Release --no-restore
+      # Cross-entity (multi-top-level-entity) transactions cannot run on the emulator, so these tests target a
+      # real Azure Service Bus namespace. The fixture creates/deletes uniquely-named queues via the admin
+      # client, so the connection string must carry the Manage claim.
+      - name: Real-namespace integration test (Service Bus)
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          CHATTER_ASB_REAL_NAMESPACE_CONNECTION_STRING: ${{ secrets.CHATTER_ASB_REAL_NAMESPACE_CONNECTION_STRING }}
+        run: dotnet test 'src/Chatter.MessageBrokers.AzureServiceBus/tests/Chatter.MessageBrokers.AzureServiceBus.Tests.csproj' -c Release --no-build --filter 'Category=RealNamespaceIntegration'

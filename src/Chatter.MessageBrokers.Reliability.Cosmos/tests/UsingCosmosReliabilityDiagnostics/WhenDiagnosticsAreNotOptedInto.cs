@@ -1,0 +1,254 @@
+using Chatter.MessageBrokers.Reliability.Cosmos.Diagnostics;
+using Chatter.MessageBrokers.Reliability.Cosmos.Tests.Diagnostics;
+using Chatter.Testing.Core.Diagnostics;
+using FluentAssertions;
+using System;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using Xunit;
+
+namespace Chatter.MessageBrokers.Reliability.Cosmos.Tests.UsingCosmosReliabilityDiagnostics
+{
+    /// <summary>
+    /// The off state of this module's diagnostics surface: an application that never subscribed to the
+    /// <see cref="CosmosReliabilityDiagnostics.ActivitySourceName"/> scope or the
+    /// <see cref="CosmosReliabilityDiagnostics.MeterName"/> scope must pay one boolean read and nothing else
+    /// (ADR-0010 R1, R2, R4).
+    /// </summary>
+    /// <remarks>
+    /// The subscribed cases live here too, and they are still off-state facts: this module's instruments emit only
+    /// when the Outbox Relay records a measurement, so a scope attached to both names observing NOTHING while no
+    /// document is drained is the stronger statement — if nothing reaches a listener that IS attached, nothing
+    /// reaches one that is not. What an opted-in application receives once the Outbox Relay does record is pinned by
+    /// <see cref="WhenRecordingDrainMeasurements"/>.
+    /// </remarks>
+    [Collection(DiagnosticsCollection.Name)]
+    public class WhenDiagnosticsAreNotOptedInto : Testing.Core.Context
+    {
+        /// <summary>The Change-Feed Source Identity the lease-tagged probes emit under, standing in for a processor name.</summary>
+        private const string SourceIdentity = "chatter-cosmos-outbox-relay:source-a";
+
+        // Built ONCE, at class-initialisation time, so the off-state probe measures the record methods and not the
+        // allocation of the failure handed to one of them.
+        private static readonly Exception _offGuardProbeFailure = new InvalidOperationException("the drain faulted");
+
+        [Fact]
+        public void MustReportDiagnosticsDisabledInAnEmptyProcess()
+        {
+            CosmosReliabilityDiagnostics.IsEnabled.Should().BeFalse();
+        }
+
+        [Fact]
+        public void MustReportDiagnosticsDisabledWhileForeignInstrumentationIsRunning()
+        {
+            using (var foreignInstrumentation = new ForeignInstrumentationScope())
+            {
+                Activity.Current.Should().BeSameAs(foreignInstrumentation.ForeignActivity);
+
+                // INVARIANT: ADR-0010 R2/R3 - a non-null ambient Activity is NOT an opt-in.
+                CosmosReliabilityDiagnostics.IsEnabled.Should().BeFalse();
+            }
+        }
+
+        [Fact]
+        public void MustNotAllocateWhileEvaluatingTheOffGuard()
+        {
+            CosmosReliabilityDiagnostics.IsEnabled.Should().BeFalse();
+
+            var measurement = GuardCostProbe.Measure<bool>(() => CosmosReliabilityDiagnostics.IsEnabled);
+
+            measurement.MedianAllocatedBytesPerBatch.Should().Be(0, "the off-guard is a boolean read: " + measurement);
+        }
+
+        /// <summary>
+        /// Merely subscribing emits nothing: an application that attached both a .NET <c>ActivityListener</c> and a
+        /// .NET <c>MeterListener</c> and then drained no document receives no span and no measurement.
+        /// </summary>
+        [Fact]
+        public void MustEmitNothingUntilTheOutboxRelayRecordsAMeasurement()
+        {
+            using (var activityScope = new RecordingActivityScope(CosmosReliabilityDiagnostics.ActivitySourceName))
+            using (var meterScope = new RecordingMeterScope(CosmosReliabilityDiagnostics.MeterName))
+            {
+                CosmosReliabilityDiagnostics.IsEnabled.Should().BeTrue();
+
+                activityScope.StartedActivities.Should().BeEmpty();
+                meterScope.Measurements.Should().BeEmpty();
+            }
+        }
+
+        [Fact]
+        public void MustDeclareTheDrainInstrumentsOnTheModuleMeter()
+        {
+            DeclareInstruments();
+
+            using (var meterScope = new RecordingMeterScope(CosmosReliabilityDiagnostics.MeterName))
+            {
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainLagInstrumentName, out var drainLag).Should().BeTrue();
+                drainLag.Unit.Should().Be("s");
+
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainedDocumentsInstrumentName, out var drainedDocuments).Should().BeTrue();
+                drainedDocuments.Unit.Should().Be("{document}");
+
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainBatchSizeInstrumentName, out var batchSize).Should().BeTrue();
+                batchSize.Unit.Should().Be("{document}");
+
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainedBatchesInstrumentName, out var drainedBatches).Should().BeTrue();
+                drainedBatches.Unit.Should().Be("{batch}");
+
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainUndeliverableInstrumentName, out var drainUndeliverable).Should().BeTrue();
+                drainUndeliverable.Unit.Should().Be("{document}");
+
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainSuspensionsInstrumentName, out var drainSuspensions).Should().BeTrue();
+                drainSuspensions.Unit.Should().Be("{suspension}");
+            }
+        }
+
+        /// <summary>
+        /// Off must mean off for the two instruments that report the Outbox Relay declining to keep republishing: an
+        /// application that subscribed to nothing pays one boolean read per record method and builds no lease token
+        /// and no <c>TagList</c> (ADR-0010 R1).
+        /// </summary>
+        [Fact]
+        public void MustBuildNoTagForARelayStopSignalWhileNothingIsOptedInto()
+        {
+            CosmosReliabilityDiagnostics.IsEnabled.Should().BeFalse();
+
+            var measurement = GuardCostProbe.Measure(RecordOneRelayStopSignalOfEachKind);
+
+            measurement.MedianAllocatedBytesPerBatch.Should().Be(0, "no attribute may be built while off: " + measurement);
+        }
+
+        /// <summary>
+        /// A .NET <c>ActivityListener</c> on this module's scope and NO .NET <c>MeterListener</c> makes
+        /// <see cref="CosmosReliabilityDiagnostics.IsEnabled"/> TRUE, which is precisely why each record method
+        /// guards on its OWN instrument: a tracing-only application publishes no measurement, builds no attribute
+        /// and starts no span (ADR-0010 R1, R2).
+        /// </summary>
+        [Fact]
+        public void MustRecordNoRelayStopSignalForATracingOnlyOptIn()
+        {
+            using (var activityScope = new RecordingActivityScope(CosmosReliabilityDiagnostics.ActivitySourceName))
+            {
+                CosmosReliabilityDiagnostics.IsEnabled.Should().BeTrue();
+
+                var measurement = GuardCostProbe.Measure(RecordOneRelayStopSignalOfEachKind);
+
+                measurement.MedianAllocatedBytesPerBatch.Should().Be(0, "no attribute may be built for an instrument nobody enabled: " + measurement);
+                activityScope.StartedActivities.Should().BeEmpty();
+            }
+        }
+
+        /// <summary>Drives both record methods once, as an undeliverable document and a suspended lease each do.</summary>
+        private static void RecordOneRelayStopSignalOfEachKind()
+        {
+            CosmosReliabilityDiagnostics.RecordUndeliverableDocument();
+            CosmosReliabilityDiagnostics.RecordDrainSuspension(SourceIdentity, "lease-0");
+        }
+
+        /// <summary>
+        /// The three LEASE-TAGGED emit methods each carry a SECOND tag now — the Change-Feed Source Identity that
+        /// disambiguates a Lease Token across two co-resident sources — and off must still cost nothing at all three
+        /// sites. Both arguments are already-materialized strings, so nothing is BUILT before each instrument's own
+        /// guard runs and no <c>TagList</c> is constructed for a meter nobody enabled (ADR-0010 R1).
+        /// </summary>
+        /// <remarks>
+        /// This is also what keeps the suspension site's documented NO-OUTER-GUARD call safe: the gate calls
+        /// <see cref="CosmosReliabilityDiagnostics.RecordDrainSuspension"/> without first reading
+        /// <see cref="CosmosReliabilityDiagnostics.IsEnabled"/>, which is correct precisely because the arguments are
+        /// values the caller already holds. Adding a second STRING argument does not change that; adding one that had
+        /// to be COMPUTED would, and this probe is what would catch it.
+        /// </remarks>
+        [Fact]
+        public void MustBuildNoTagForALeaseTaggedMeasurementWhileNothingIsOptedInto()
+        {
+            CosmosReliabilityDiagnostics.IsEnabled.Should().BeFalse();
+
+            var measurement = GuardCostProbe.Measure(RecordOneLeaseTaggedMeasurementOfEachKind);
+
+            measurement.MedianAllocatedBytesPerBatch.Should().Be(0, "no attribute may be built while off: " + measurement);
+        }
+
+        /// <summary>
+        /// The tracing-only mirror at the same three sites: <see cref="CosmosReliabilityDiagnostics.IsEnabled"/> is
+        /// TRUE, which is exactly why no emit method may guard on it — each guards on its OWN instrument, so a
+        /// metrics-less application builds neither tag (ADR-0010 R1, R2).
+        /// </summary>
+        [Fact]
+        public void MustRecordNoLeaseTaggedMeasurementForATracingOnlyOptIn()
+        {
+            using (var activityScope = new RecordingActivityScope(CosmosReliabilityDiagnostics.ActivitySourceName))
+            {
+                CosmosReliabilityDiagnostics.IsEnabled.Should().BeTrue();
+
+                var measurement = GuardCostProbe.Measure(RecordOneLeaseTaggedMeasurementOfEachKind);
+
+                measurement.MedianAllocatedBytesPerBatch.Should().Be(0, "no attribute may be built for an instrument nobody enabled: " + measurement);
+                activityScope.StartedActivities.Should().BeEmpty();
+            }
+        }
+
+        /// <summary>Drives every lease-tagged emit method once, as one drained, faulted and suspended lease does.</summary>
+        private static void RecordOneLeaseTaggedMeasurementOfEachKind()
+        {
+            CosmosReliabilityDiagnostics.RecordDrainedBatch(SourceIdentity, "lease-0", documentCount: 1);
+            CosmosReliabilityDiagnostics.RecordDrainFailure(SourceIdentity, "lease-0", _offGuardProbeFailure);
+            CosmosReliabilityDiagnostics.RecordDrainSuspension(SourceIdentity, "lease-0");
+        }
+
+        /// <summary>
+        /// The bucket boundaries a collector aggregates the drain lag into. The instrument reports SECONDS, so it must
+        /// publish seconds-sized boundaries as instrument advice; without them a collector falls back to its own
+        /// millisecond-sized defaults, every realistic lag lands in the first bucket, and every percentile the
+        /// histogram reports is the same meaningless number (issue #399).
+        /// </summary>
+        /// <remarks>
+        /// The boundaries reach further than the send path's own duration histogram because a drain lag is not one
+        /// client call: a document waits for the change feed, and a restarted lease or a backlog can leave it pending
+        /// for minutes.
+        /// </remarks>
+        [Fact]
+        public void MustPublishSecondsSizedBucketBoundariesOnTheDrainLagHistogram()
+        {
+            DeclareInstruments();
+
+            using (var meterScope = new RecordingMeterScope(CosmosReliabilityDiagnostics.MeterName))
+            {
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainLagInstrumentName, out var drainLag).Should().BeTrue();
+
+                var drainLagHistogram = drainLag.Should().BeAssignableTo<Instrument<double>>().Subject;
+
+                drainLagHistogram.Advice.Should().NotBeNull();
+                drainLagHistogram.Advice.HistogramBucketBoundaries.Should().Equal(new[] { 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 600 });
+            }
+        }
+
+        /// <summary>
+        /// The same unit-sized-boundary rule on the batch-size histogram, whose unit is DOCUMENTS: a change-feed batch
+        /// carries single or double digits of documents far more often than the thousands a collector's default
+        /// boundaries are shaped for.
+        /// </summary>
+        [Fact]
+        public void MustPublishDocumentSizedBucketBoundariesOnTheBatchSizeHistogram()
+        {
+            DeclareInstruments();
+
+            using (var meterScope = new RecordingMeterScope(CosmosReliabilityDiagnostics.MeterName))
+            {
+                meterScope.TryGetInstrument(CosmosReliabilityDiagnostics.DrainBatchSizeInstrumentName, out var batchSize).Should().BeTrue();
+
+                var batchSizeHistogram = batchSize.Should().BeAssignableTo<Instrument<int>>().Subject;
+
+                batchSizeHistogram.Advice.Should().NotBeNull();
+                batchSizeHistogram.Advice.HistogramBucketBoundaries.Should().Equal(new[] { 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000 });
+            }
+        }
+
+        /// <summary>
+        /// Reads the off-guard so the static surface initialises, and with it publishes its instruments, BEFORE a
+        /// listener attaches. A <c>MeterListener</c> replays already-published instruments when it starts, so the
+        /// lookup is timing-proof in both orders.
+        /// </summary>
+        private static void DeclareInstruments() => _ = CosmosReliabilityDiagnostics.IsEnabled;
+    }
+}

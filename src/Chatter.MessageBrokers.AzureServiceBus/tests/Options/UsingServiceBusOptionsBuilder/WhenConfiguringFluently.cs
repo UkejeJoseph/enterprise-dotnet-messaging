@@ -1,0 +1,126 @@
+using Azure.Core;
+using Chatter.MessageBrokers.AzureServiceBus.Options;
+using FluentAssertions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
+
+namespace Chatter.MessageBrokers.AzureServiceBus.Tests.Options.UsingServiceBusOptionsBuilder
+{
+    // Uses a real ServiceCollection + ConfigurationBuilder (no Moq of sealed config types).
+    // Each fluent setter must return the same builder instance for chaining.
+    public class WhenConfiguringFluently : Testing.Core.Context
+    {
+        private readonly IServiceCollection _services = new ServiceCollection();
+        private readonly IConfiguration _configuration =
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string>()).Build();
+
+        private ServiceBusOptionsBuilder CreateSut()
+            => ServiceBusOptionsBuilder.Create(_services, _configuration);
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithConnectionString()
+        {
+            var sut = CreateSut();
+            sut.WithConnectionString("conn").Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithMaxConcurrentCalls()
+        {
+            var sut = CreateSut();
+            sut.WithMaxConcurrentCalls(8).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithPrefetchCount()
+        {
+            var sut = CreateSut();
+            sut.WithPrefetchCount(3).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithMaxMessageLockRenewalDuration()
+        {
+            var sut = CreateSut();
+            sut.WithMaxMessageLockRenewalDuration(TimeSpan.FromMinutes(2)).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithNoRetry()
+        {
+            var sut = CreateSut();
+            sut.WithNoRetry().Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromWithExponentialDelay()
+        {
+            var sut = CreateSut();
+            sut.WithExponentialDelay(5, 30, 1, 3).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustLetTheSdkRejectAFluentRetryCountAtTheFluentCallSite()
+        {
+            // With nothing ahead of it, ServiceBusRetryOptions.MaxRetries rejects 101 from its own setter
+            // INSIDE WithExponentialDelay, so the throw lands AT THE FLUENT CALL SITE rather than at
+            // Build() — which is where master raised it too.
+            var sut = CreateSut();
+
+            Action withExponentialDelay = () => sut.WithExponentialDelay(101, 30, 1, 3);
+
+            withExponentialDelay.Should().Throw<ArgumentOutOfRangeException>();
+        }
+
+        [Fact]
+        public void MustNotTreatFluentMinimumBackoffGreaterThanMaximumBackoffAsAViolation()
+        {
+            // The SDK CLAMPS a Delay above MaxDelay while computing each retry delay. That is not a crash, so
+            // nothing on this path refuses it — the fluent call carries both values straight to the SDK.
+            var sut = CreateSut();
+
+            Action withExponentialDelay = () => sut.WithExponentialDelay(5, 5, 60, 3);
+
+            withExponentialDelay.Should().NotThrow();
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromAddTokenProviderInstance()
+        {
+            var sut = CreateSut();
+            sut.AddTokenProvider(new MarkerTokenCredential()).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromAddTokenProviderFactory()
+        {
+            var sut = CreateSut();
+            sut.AddTokenProvider(() => new MarkerTokenCredential()).Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustReturnSameBuilderFromUseConfig()
+        {
+            var sut = CreateSut();
+            sut.UseConfig().Should().BeSameAs(sut);
+        }
+
+        [Fact]
+        public void MustExposeServiceCollection()
+            => CreateSut().Services.Should().BeSameAs(_services);
+
+        private sealed class MarkerTokenCredential : TokenCredential
+        {
+            public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+                => new AccessToken("t", DateTimeOffset.MaxValue);
+
+            public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken)
+                => new ValueTask<AccessToken>(new AccessToken("t", DateTimeOffset.MaxValue));
+        }
+    }
+}

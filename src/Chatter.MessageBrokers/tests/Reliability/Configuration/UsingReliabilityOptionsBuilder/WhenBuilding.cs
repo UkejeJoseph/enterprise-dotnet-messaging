@@ -1,0 +1,1019 @@
+using Chatter.MessageBrokers.Context;
+using Chatter.MessageBrokers.Exceptions;
+using Chatter.MessageBrokers.Reliability;
+using Chatter.MessageBrokers.Reliability.Configuration;
+using Chatter.MessageBrokers.Sending;
+using FluentAssertions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
+
+namespace Chatter.MessageBrokers.Tests.Reliability.Configuration.UsingReliabilityOptionsBuilder
+{
+    public class WhenBuilding : Testing.Core.Context
+    {
+        [Fact]
+        public void MustBuildDefaultOptions()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).Build();
+
+            options.RouteMessagesToOutbox.Should().BeFalse();
+            options.MinutesToLiveInMemory.Should().Be(10);
+            options.EnableOutboxPollingProcessor.Should().BeFalse();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(5000);
+            options.InMemoryInboxDeduplicationWindowInMinutes.Should().Be(60);
+            options.InMemoryInboxMaxEntries.Should().Be(200000);
+            options.OutboxPollBatchSize.Should().Be(100);
+            options.OutboxDispatchBackoffBaseInSeconds.Should().Be(5);
+            options.OutboxDispatchBackoffCapInSeconds.Should().Be(60);
+            options.OutboxMaxDispatchAttempts.Should().BeNull();
+        }
+
+        [Fact]
+        public void MustNotRegisterAnyServiceWhenResolved()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxRouting().Resolve();
+
+            options.RouteMessagesToOutbox.Should().BeTrue();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(5000);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A configured value of the wrong TYPE is the one configuration failure that still happens while
+        /// the options are being built, and the one that names the key: <c>ConfigurationBinder</c> cannot
+        /// convert it, so it throws out of <c>Build()</c> before any runtime sink sees the value. Recorded
+        /// here so the distinction between a conversion failure and the absent semantic validation issue
+        /// #423 tracks is pinned rather than only described in prose. The message is asserted only for the
+        /// KEY PATH, not the framework's wording of the rest.
+        /// </summary>
+        [Fact]
+        public void MustFailInTheBinderNamingTheKeyWhenAConfiguredValueIsNotConvertible()
+        {
+            var services = new ServiceCollection();
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:MinutesToLiveInMemory"] = "abc"
+                })
+                .Build();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            fromConfig.Should().Throw<InvalidOperationException>()
+                      .Which.Message.Should().Contain($"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:MinutesToLiveInMemory");
+        }
+
+        [Fact]
+        public void MustThrowArgumentNullExceptionWhenServicesIsNull()
+        {
+            var create = () => ReliabilityOptionsBuilder.Create(null);
+
+            create.Should().Throw<ArgumentNullException>();
+        }
+
+        [Fact]
+        public void MustEnableOutboxRoutingWhenWithOutboxRoutingCalled()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxRouting().Build();
+
+            options.RouteMessagesToOutbox.Should().BeTrue();
+        }
+
+        [Fact]
+        public void MustReflectWithInMemoryOutboxTimeToLive()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithInMemoryOutboxTimeToLive(99).Build();
+
+            options.MinutesToLiveInMemory.Should().Be(99);
+        }
+
+        [Fact]
+        public void MustReflectWithInMemoryInboxDeduplicationWindow()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithInMemoryInboxDeduplicationWindow(15).Build();
+
+            options.InMemoryInboxDeduplicationWindowInMinutes.Should().Be(15);
+        }
+
+        [Fact]
+        public void MustReflectWithInMemoryInboxMaxEntries()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithInMemoryInboxMaxEntries(1500).Build();
+
+            options.InMemoryInboxMaxEntries.Should().Be(1500);
+        }
+
+        [Fact]
+        public void MustReflectWithOutboxPollBatchSize()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxPollBatchSize(250).Build();
+
+            options.OutboxPollBatchSize.Should().Be(250);
+        }
+
+        [Fact]
+        public void MustReflectWithOutboxDispatchBackoff()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxDispatchBackoff(3, 30).Build();
+
+            options.OutboxDispatchBackoffBaseInSeconds.Should().Be(3);
+            options.OutboxDispatchBackoffCapInSeconds.Should().Be(30);
+        }
+
+        [Fact]
+        public void MustReflectWithOutboxMaxDispatchAttempts()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxMaxDispatchAttempts(7).Build();
+
+            options.OutboxMaxDispatchAttempts.Should().Be(7);
+        }
+
+        /// <summary>
+        /// The delay between two dispatch attempts of the same outbox message is derived from the attempt count the
+        /// message itself carries, so it needs no stored schedule: it starts at the base, doubles per attempt and
+        /// stops at the cap. An attempt count below one is read as the first attempt rather than as a delay shorter
+        /// than the base, and the arithmetic stays in double so the largest and smallest counts an <c>int</c> can
+        /// hold land on the base and the cap instead of wrapping.
+        /// </summary>
+        [Theory]
+        [InlineData(int.MinValue, 5)]
+        [InlineData(0, 5)]
+        [InlineData(1, 5)]
+        [InlineData(2, 10)]
+        [InlineData(3, 20)]
+        [InlineData(4, 40)]
+        [InlineData(5, 60)]
+        [InlineData(6, 60)]
+        [InlineData(int.MaxValue, 60)]
+        public void MustDoubleTheDispatchBackoffPerAttemptAndStopAtTheCap(int dispatchAttempts, int expectedDelayInSeconds)
+        {
+            var services = new ServiceCollection();
+            var options = ReliabilityOptionsBuilder.Create(services).Build();
+
+            var delay = options.CalculateDispatchBackoff(dispatchAttempts);
+
+            delay.Should().Be(TimeSpan.FromSeconds(expectedDelayInSeconds));
+        }
+
+        /// <summary>
+        /// The backoff ships with a working default because it is the mechanism that stops a permanently-failing row
+        /// from holding its place at the head of every poll batch. A directly constructed
+        /// <c>ReliabilityOptions</c> that never passed through this builder must therefore still back off, which is
+        /// what the initializers on the two backoff properties are for.
+        /// </summary>
+        [Fact]
+        public void MustBackOffFromADirectlyConstructedReliabilityOptions()
+        {
+            var options = new ReliabilityOptions();
+
+            options.CalculateDispatchBackoff(1).Should().Be(TimeSpan.FromSeconds(5));
+            options.CalculateDispatchBackoff(6).Should().Be(TimeSpan.FromSeconds(60));
+        }
+
+        /// <summary>
+        /// The batch size is seeded before the section is bound, so a configured value takes the fluent default's
+        /// place rather than being overwritten by it. This builder binds no section of its own except the one
+        /// <c>FromConfig</c> resolves, so the fluent default is the only fluent value a configured one can be
+        /// stated against here; the parent builder pins the same precedence over an explicit fluent call.
+        /// </summary>
+        [Fact]
+        public void MustHonourAConfiguredOutboxPollBatchSizeOverItsFluentDefault()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxPollBatchSize("25"));
+
+            options.OutboxPollBatchSize.Should().Be(25);
+        }
+
+        /// <summary>
+        /// Both in-memory inbox settings are seeded before the section is bound, so a configured value takes the
+        /// fluent default's place rather than being overwritten by it.
+        /// </summary>
+        [Fact]
+        public void MustHonourConfiguredInMemoryInboxSettingsOverTheirFluentDefaults()
+        {
+            var services = new ServiceCollection();
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:InMemoryInboxDeduplicationWindowInMinutes"] = "5",
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:InMemoryInboxMaxEntries"] = "25"
+                })
+                .Build();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.InMemoryInboxDeduplicationWindowInMinutes.Should().Be(5);
+            options.InMemoryInboxMaxEntries.Should().Be(25);
+        }
+
+        [Fact]
+        public void MustEnableOutboxPollingProcessorWithCustomIntervalWhenWithOutboxPollingProcessorCalled()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxPollingProcessor(7500).Build();
+
+            options.EnableOutboxPollingProcessor.Should().BeTrue();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(7500);
+        }
+
+        [Fact]
+        public void MustEnableOutboxPollingProcessorWithDefaultIntervalWhenWithOutboxPollingProcessorCalledWithoutArgument()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxPollingProcessor().Build();
+
+            options.EnableOutboxPollingProcessor.Should().BeTrue();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(5000);
+        }
+
+        [Fact]
+        public void MustHonourConfiguredValuesAndRetainOmittedFluentDefaultsWhenFromConfigSectionPopulated()
+        {
+            var services = new ServiceCollection();
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:RouteMessagesToOutbox"] = "true",
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxProcessingIntervalInMilliseconds"] = "1234"
+                })
+                .Build();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.Should().NotBeNull();
+            options.RouteMessagesToOutbox.Should().BeTrue();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(1234);
+            options.MinutesToLiveInMemory.Should().Be(10);
+            options.EnableOutboxPollingProcessor.Should().BeFalse();
+        }
+
+        [Fact]
+        public void MustRetainEveryFluentDefaultWhenFromConfigSectionPresentWithoutChildKeys()
+        {
+            var services = new ServiceCollection();
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [ReliabilityOptionsBuilder.ReliabilityOptionsSectionName] = string.Empty
+                })
+                .Build();
+            configuration.GetSection(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName).Exists().Should().BeTrue();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.RouteMessagesToOutbox.Should().BeFalse();
+            options.MinutesToLiveInMemory.Should().Be(10);
+            options.EnableOutboxPollingProcessor.Should().BeFalse();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(5000);
+        }
+
+        [Fact]
+        public void MustResolveTheBuiltOptionsFromIOptionsWhenFromConfigSectionPopulated()
+        {
+            var services = new ServiceCollection();
+
+            ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithRouteMessagesToOutbox());
+
+            using var provider = services.BuildServiceProvider();
+
+            provider.GetRequiredService<IOptions<ReliabilityOptions>>().Value
+                .Should().BeSameAs(provider.GetRequiredService<ReliabilityOptions>());
+        }
+
+        [Fact]
+        public void MustResolveTheBuiltOptionsFromIOptionsSnapshotWhenFromConfigSectionPopulated()
+        {
+            var services = new ServiceCollection();
+
+            ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithRouteMessagesToOutbox());
+
+            using var provider = services.BuildServiceProvider();
+
+            provider.GetRequiredService<IOptionsSnapshot<ReliabilityOptions>>().Value
+                .Should().BeSameAs(provider.GetRequiredService<ReliabilityOptions>());
+        }
+
+        [Fact]
+        public void MustResolveTheBuiltOptionsFromIOptionsMonitorWhenFromConfigSectionPopulated()
+        {
+            var services = new ServiceCollection();
+
+            ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithRouteMessagesToOutbox());
+
+            using var provider = services.BuildServiceProvider();
+
+            provider.GetRequiredService<IOptionsMonitor<ReliabilityOptions>>().CurrentValue
+                .Should().BeSameAs(provider.GetRequiredService<ReliabilityOptions>());
+        }
+
+        [Fact]
+        public void MustRetainOmittedFluentDefaultsOnTheBuiltOptionsWhenFromConfigSectionPopulated()
+        {
+            var services = new ServiceCollection();
+
+            ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithRouteMessagesToOutbox());
+
+            using var provider = services.BuildServiceProvider();
+            var builtOptions = provider.GetRequiredService<IOptions<ReliabilityOptions>>().Value;
+
+            builtOptions.RouteMessagesToOutbox.Should().BeTrue();
+            builtOptions.OutboxProcessingIntervalInMilliseconds.Should().Be(5000);
+            builtOptions.MinutesToLiveInMemory.Should().Be(10);
+        }
+
+        /// <summary>
+        /// <c>Task.Delay(0)</c> is legal and completes immediately, so how aggressively the outbox is polled is the
+        /// operator's call.
+        /// </summary>
+        [Fact]
+        public void MustAllowAZeroOutboxProcessingInterval()
+        {
+            var services = new ServiceCollection();
+            var configuration = BuildConfigurationWithOutboxProcessingInterval("0", enableOutboxPollingProcessor: true);
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(0);
+        }
+
+        /// <summary>
+        /// <c>Task.Delay</c> rejects anything below -1, so an enabled outbox polling processor configured this way
+        /// faults the whole background service. This builder used to bind the value and let the host start, and the
+        /// acceptance was recorded here as a deferral naming issue #423. #423 closes it: the value is now refused at
+        /// build time, and the deferral record becomes the pin for the refusal. The poller is stated here because
+        /// the refusal is asked only of a host that will run one - see the two pins below.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredOutboxProcessingIntervalOfNegativeFive()
+        {
+            var services = new ServiceCollection();
+            var configuration = BuildConfigurationWithOutboxProcessingInterval("-5", enableOutboxPollingProcessor: true);
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>();
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// <c>BrokeredMessageOutboxProcessor</c> is the interval's only reader and <c>ChatterMessageBrokerExtensions</c>
+        /// registers it only when <c>EnableOutboxPollingProcessor</c> is set, so with the poller off nothing will ever
+        /// wait on this value and a host carrying a stale out-of-range one must still start.
+        /// </summary>
+        [Fact]
+        public void MustAcceptAnOutOfRangeOutboxProcessingIntervalWhenTheOutboxPollingProcessorIsDisabled()
+        {
+            var services = new ServiceCollection();
+            var configuration = BuildConfigurationWithOutboxProcessingInterval("-5", enableOutboxPollingProcessor: false);
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.EnableOutboxPollingProcessor.Should().BeFalse();
+            options.OutboxProcessingIntervalInMilliseconds.Should().Be(-5);
+            using var provider = services.BuildServiceProvider();
+            provider.GetRequiredService<ReliabilityOptions>().Should().BeSameAs(options);
+        }
+
+        /// <summary>
+        /// The same value the disabled poller keeps: turning the poller on is the whole difference between the two
+        /// pins, so the refusal is narrowed to the hosts that run a poller rather than lifted.
+        /// </summary>
+        [Fact]
+        public void MustRefuseTheSameOutOfRangeOutboxProcessingIntervalWhenTheOutboxPollingProcessorIsEnabled()
+        {
+            var services = new ServiceCollection();
+            var configuration = BuildConfigurationWithOutboxProcessingInterval("-5", enableOutboxPollingProcessor: true);
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxProcessingIntervalInMilliseconds)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// -1 is <c>Timeout.Infinite</c>, so <c>Task.Delay</c> takes it happily and an ENABLED poller then waits for
+        /// good. The polling sink is the only thing that can express 'never poll again', and it cannot, so the value
+        /// is refused rather than bound into a processor that would silently stop.
+        /// </summary>
+        [Theory]
+        [InlineData(0)]
+        [InlineData(5000)]
+        [InlineData(-1)]
+        [InlineData(-5)]
+        [InlineData(int.MinValue)]
+        public void MustAgreeWithTheOutboxPollingSinkAboutAConfiguredProcessingInterval(int interval)
+        {
+            var services = new ServiceCollection();
+            var theSinkCanPollAtIt = TaskDelayAccepts(interval) && interval != Timeout.Infinite;
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxProcessingInterval(interval.ToString(), enableOutboxPollingProcessor: true));
+
+            if (theSinkCanPollAtIt)
+            {
+                fromConfig.Should().NotThrow<ConfiguredValueRefusedException>();
+            }
+            else
+            {
+                fromConfig.Should().Throw<ConfiguredValueRefusedException>();
+                services.Should().BeEmpty();
+            }
+        }
+
+        /// <summary>
+        /// The double converter takes "NaN" and "1e300" straight off a configuration section, so the verdict on each
+        /// is the real outbox's rather than a house rule: a ttl the expiry scan expires nothing under, or schedules a
+        /// real future expiry with, is accepted, and one it treats a just-processed message as already expired under
+        /// is refused. A non-positive ttl is accepted however large its magnitude - the scan returns on it before it
+        /// computes anything at all - and so is "1e300", which INVERTED from refused to accepted once the scan
+        /// stopped computing an expiry instant the sink could reject: it now compares elapsed minutes against the
+        /// ttl, so no magnitude faults it. A NaN and a positive infinity are stated by their own facts below,
+        /// because the builder refuses those as intent rather than deriving the verdict from the scan.
+        /// </summary>
+        [Theory]
+        [InlineData("0")]
+        [InlineData("10")]
+        [InlineData("-5")]
+        [InlineData("NaN")]
+        [InlineData("-Infinity")]
+        [InlineData("1e300")]
+        [InlineData("-1e300")]
+        public async Task MustAgreeWithTheExpiryScanAboutAConfiguredMinutesToLiveInMemory(string minutesToLiveInMemory)
+        {
+            var services = new ServiceCollection();
+            var observation = await ObserveTheRealExpiryScan(double.Parse(minutesToLiveInMemory, CultureInfo.InvariantCulture));
+            var theSinkCanScheduleIt = observation == ExpiryScanObservation.ExpiredNothing
+                                    || observation == ExpiryScanObservation.ScheduledAFutureExpiry;
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithMinutesToLiveInMemory(minutesToLiveInMemory));
+
+            if (theSinkCanScheduleIt)
+            {
+                fromConfig.Should().NotThrow<ConfiguredValueRefusedException>();
+            }
+            else
+            {
+                fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                          .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.MinutesToLiveInMemory)}");
+                services.Should().BeEmpty();
+            }
+        }
+
+        /// <summary>
+        /// A NaN ttl is the exact value this module measured slipping through the outbox's own <c>ttl &lt;= 0</c>
+        /// disable guard - every comparison against a NaN is false - so the scan it reaches is asked here whether it
+        /// left everything in place, and it did not. Nothing in the scan can be asked that question on its own, so
+        /// the outbox is driven instead.
+        /// </summary>
+        [Fact]
+        public async Task MustRefuseAConfiguredNaNMinutesToLiveInMemoryTheExpiryScanDoesNotDisableItselfFor()
+        {
+            var services = new ServiceCollection();
+            (await ObserveTheRealExpiryScan(double.NaN)).Should().NotBe(ExpiryScanObservation.ExpiredNothing);
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithMinutesToLiveInMemory("NaN"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.MinutesToLiveInMemory)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A positive infinity is the one refused ttl the expiry scan itself runs without complaint, so it is stated
+        /// apart from the theory above rather than folded into an oracle that would then have to restate the
+        /// builder's own rule. The scan expires nothing under it, exactly as a non-positive ttl already says plainly;
+        /// it is refused because it names no number of minutes, not because any arithmetic rejects it.
+        /// </summary>
+        [Fact]
+        public async Task MustRefuseAConfiguredInfiniteMinutesToLiveInMemoryTheExpiryScanRunsWithoutFaulting()
+        {
+            var services = new ServiceCollection();
+            (await ObserveTheRealExpiryScan(double.PositiveInfinity)).Should().Be(ExpiryScanObservation.ExpiredNothing);
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithMinutesToLiveInMemory("Infinity"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.MinutesToLiveInMemory)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// The cap is the in-memory inbox's memory safety valve, so a cap of zero would retain no receipt at all while
+        /// the inbox still allocated for every one of them - deduplicating nothing under a setting that reads like a
+        /// retention limit. It is refused rather than treated as 'disabled': the deduplication window is where an
+        /// operator says how long a receipt lives.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredInMemoryInboxMaxEntriesOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxMaxEntries("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.InMemoryInboxMaxEntries)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 entry");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative cap names no number of receipts the inbox could hold, so there is nothing for it to mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeInMemoryInboxMaxEntries()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxMaxEntries("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.InMemoryInboxMaxEntries)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// One receipt is the smallest cap the inbox can still deduplicate an immediate redelivery under, so the bound
+        /// stops exactly there rather than at some larger house minimum.
+        /// </summary>
+        [Fact]
+        public void MustAcceptTheSmallestInMemoryInboxMaxEntriesTheInboxCanHold()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxMaxEntries("1"));
+
+            options.InMemoryInboxMaxEntries.Should().Be(1);
+            using var provider = services.BuildServiceProvider();
+            provider.GetRequiredService<ReliabilityOptions>().Should().BeSameAs(options);
+        }
+
+        /// <summary>
+        /// The window is the in-memory inbox's ONLY reclamation rule: every entry it holds, a completed receipt and an
+        /// in-flight reservation alike, is released by that rule and by nothing else. A window of zero would therefore
+        /// leave no entry reclaimable at all - a hung handler's reservation would never end and the cap, which never
+        /// takes a reservation the window still honours, would have nothing left to evict. It is refused rather than
+        /// read as 'disabled': there is no configuration under which the inbox is allowed to hold an entry forever.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredInMemoryInboxDeduplicationWindowOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxDeduplicationWindow("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.InMemoryInboxDeduplicationWindowInMinutes)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 minute");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative window names no period a receipt could be remembered for, so there is nothing for it to mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeInMemoryInboxDeduplicationWindow()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxDeduplicationWindow("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.InMemoryInboxDeduplicationWindowInMinutes)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// One minute is the shortest window the setting can express, so the bound stops exactly there rather than at
+        /// some larger house minimum.
+        /// </summary>
+        [Fact]
+        public void MustAcceptTheSmallestInMemoryInboxDeduplicationWindowTheSettingCanExpress()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithInMemoryInboxDeduplicationWindow("1"));
+
+            options.InMemoryInboxDeduplicationWindowInMinutes.Should().Be(1);
+            using var provider = services.BuildServiceProvider();
+            provider.GetRequiredService<ReliabilityOptions>().Should().BeSameAs(options);
+        }
+
+        /// <summary>
+        /// A batch of zero names no message the poll could take, so the outbox would be drained of nothing on every
+        /// pass while the poller went on running. It is refused rather than read as 'disabled': the poller switch is
+        /// where an operator says the outbox is not to be polled.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredOutboxPollBatchSizeOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxPollBatchSize("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxPollBatchSize)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 message");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative batch names no number of messages the poll could take, so there is nothing for it to mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeOutboxPollBatchSize()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxPollBatchSize("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxPollBatchSize)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// The backoff settings and the attempt ceiling are seeded before the section is bound, so a configured
+        /// value takes the fluent default's place rather than being overwritten by it.
+        /// </summary>
+        [Fact]
+        public void MustHonourAConfiguredDispatchBackoffAndAttemptCeilingOverTheirFluentDefaults()
+        {
+            var services = new ServiceCollection();
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxDispatchBackoffBaseInSeconds"] = "2",
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxDispatchBackoffCapInSeconds"] = "8",
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxMaxDispatchAttempts"] = "4"
+                })
+                .Build();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, configuration);
+
+            options.OutboxDispatchBackoffBaseInSeconds.Should().Be(2);
+            options.OutboxDispatchBackoffCapInSeconds.Should().Be(8);
+            options.OutboxMaxDispatchAttempts.Should().Be(4);
+        }
+
+        /// <summary>
+        /// A backoff base of zero names no delay at all, so a permanently-failing message would be re-attempted on
+        /// every poll and would hold its place at the head of every batch - the very wedge the backoff exists to
+        /// prevent. It is refused rather than read as 'disabled': there is no configuration under which the outbox
+        /// re-attempts a failed message without waiting.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredOutboxDispatchBackoffBaseOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxDispatchBackoffBase("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxDispatchBackoffBaseInSeconds)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 second");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative backoff base names no period the outbox could wait for, so there is nothing for it to mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeOutboxDispatchBackoffBase()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxDispatchBackoffBase("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxDispatchBackoffBaseInSeconds)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// The cap is the ceiling the doubling stops at, and the delay is never longer than it, so a cap of zero
+        /// would flatten every delay to nothing however many attempts a message had already cost.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredOutboxDispatchBackoffCapOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxDispatchBackoffCap("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxDispatchBackoffCapInSeconds)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 second");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative cap names no period the outbox could wait for, so there is nothing for it to mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeOutboxDispatchBackoffCap()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxDispatchBackoffCap("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxDispatchBackoffCapInSeconds)}");
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A cap below the base is accepted: the delay is the smaller of the two, so such a configuration names a
+        /// fixed delay of the cap rather than a growing one. It is a coherent schedule, so the builder does not
+        /// take the operator's choice away.
+        /// </summary>
+        [Fact]
+        public void MustAcceptAnOutboxDispatchBackoffCapBelowItsBase()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.Create(services).WithOutboxDispatchBackoff(30, 3).Build();
+
+            options.CalculateDispatchBackoff(1).Should().Be(TimeSpan.FromSeconds(3));
+            options.CalculateDispatchBackoff(9).Should().Be(TimeSpan.FromSeconds(3));
+        }
+
+        /// <summary>
+        /// The attempt ceiling is the OPT-IN part of the durable attempt state: absent - the default - a message is
+        /// re-attempted for good, which is what a host already running this package does today. A finite default
+        /// would start abandoning messages such a host currently keeps re-attempting.
+        /// </summary>
+        [Fact]
+        public void MustAcceptAnOmittedOutboxMaxDispatchAttempts()
+        {
+            var services = new ServiceCollection();
+
+            var options = ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxDispatchBackoffBase("5"));
+
+            options.OutboxMaxDispatchAttempts.Should().BeNull();
+            using var provider = services.BuildServiceProvider();
+            provider.GetRequiredService<ReliabilityOptions>().Should().BeSameAs(options);
+        }
+
+        /// <summary>
+        /// A ceiling of zero would abandon every message before it was ever dispatched, which is not what an
+        /// operator asking for a ceiling means. Absence is how the ceiling is turned off.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredOutboxMaxDispatchAttemptsOfZero()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxMaxDispatchAttempts("0"));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxMaxDispatchAttempts)}");
+            refusal.RefusedValue.Should().Be(0);
+            refusal.RequiredBound.Should().Be("at least 1 attempt, or absent to re-attempt for good");
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            services.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// A negative ceiling names no number of attempts a message could be given, so there is nothing for it to
+        /// mean.
+        /// </summary>
+        [Fact]
+        public void MustRefuseAConfiguredNegativeOutboxMaxDispatchAttempts()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxMaxDispatchAttempts("-5"));
+
+            fromConfig.Should().Throw<ConfiguredValueRefusedException>()
+                      .Which.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxMaxDispatchAttempts)}");
+            services.Should().BeEmpty();
+        }
+
+        [Fact]
+        public void MustNameTheRefusedPropertyValueBoundAndResolvedSectionPathWhenAConfiguredValueIsRefused()
+        {
+            var services = new ServiceCollection();
+
+            var fromConfig = () => ReliabilityOptionsBuilder.FromConfig(services, BuildConfigurationWithOutboxProcessingInterval("-5", enableOutboxPollingProcessor: true));
+
+            var refusal = fromConfig.Should().Throw<ConfiguredValueRefusedException>().Which;
+            refusal.OptionName.Should().Be($"{nameof(ReliabilityOptions)}.{nameof(ReliabilityOptions.OutboxProcessingIntervalInMilliseconds)}");
+            refusal.RefusedValue.Should().Be(-5);
+            refusal.ConfigurationPath.Should().Be(ReliabilityOptionsBuilder.ReliabilityOptionsSectionName);
+            refusal.Message.Should().Contain(refusal.OptionName)
+                   .And.Contain("-5")
+                   .And.Contain(refusal.ConfigurationPath)
+                   .And.Contain(refusal.RequiredBound);
+        }
+
+        // BrokeredMessageOutboxProcessor awaits Task.Delay(interval) with no try of its own, so Task.Delay is asked
+        // here whether it can run the configured interval rather than having its accepted range restated.
+        private static bool TaskDelayAccepts(int millisecondsDelay)
+        {
+            try
+            {
+                // INVARIANT: the already-cancelled token keeps this probe from arming a real timer. Task.Delay
+                // validates its argument before it observes the token, and the out-of-range candidates above go red
+                // the moment that stops being true.
+                _ = Task.Delay(millisecondsDelay, new CancellationToken(true));
+                return true;
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return false;
+            }
+        }
+
+        // What a real InMemoryBrokeredMessageOutbox did with a configured ttl. Nothing here restates any part of the
+        // scan: the outbox is constructed, driven and then asked what it kept, so this oracle answers out of the sink
+        // and stays free to disagree with whatever the builder's own predicate happens to say.
+        private enum ExpiryScanObservation
+        {
+            // Expired nothing: even a message processed a day ago survived it, either because the scan returned
+            // before it computed anything or because no elapsed time reaches the ttl.
+            ExpiredNothing,
+            // Scheduled a real future expiry: the day-old message went and the just-processed one stayed.
+            ScheduledAFutureExpiry,
+            // Expired a message it had processed this very instant, so the ttl bought that message no life at all.
+            ExpiredAJustProcessedMessage,
+            // Threw out of the arithmetic it reads the ttl with. No ttl reaches this now that the scan compares
+            // elapsed minutes instead of computing an expiry instant; it is kept so a reintroduced overflow is a
+            // failure here rather than a silently narrowed oracle.
+            Faulted
+        }
+
+        private const string _agedMessageId = "processed-a-day-ago";
+        private const string _freshMessageId = "processed-this-instant";
+
+        private static async Task<ExpiryScanObservation> ObserveTheRealExpiryScan(double minutesToLiveInMemory)
+        {
+            var outbox = new InMemoryBrokeredMessageOutbox(NullLogger<InMemoryBrokeredMessageOutbox>.Instance,
+                                                           new ReliabilityOptions { MinutesToLiveInMemory = minutesToLiveInMemory });
+
+            await outbox.SendToOutbox(CreateOutbound(_agedMessageId), new TransactionContext());
+            await outbox.SendToOutbox(CreateOutbound(_freshMessageId), new TransactionContext());
+            var stored = (await outbox.GetUnprocessedMessagesFromOutbox()).ToDictionary(message => message.MessageId);
+            stored[_agedMessageId].ProcessedFromOutboxAtUtc = DateTime.UtcNow.AddDays(-1);
+
+            try
+            {
+                // Stamps the fresh message with the current time and runs the expiry scan over both of them.
+                await outbox.UpdateProcessedDate(stored[_freshMessageId]);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return ExpiryScanObservation.Faulted;
+            }
+
+            if (!await RemainsInTheOutbox(outbox, _freshMessageId))
+            {
+                return ExpiryScanObservation.ExpiredAJustProcessedMessage;
+            }
+
+            return await RemainsInTheOutbox(outbox, _agedMessageId)
+                ? ExpiryScanObservation.ExpiredNothing
+                : ExpiryScanObservation.ScheduledAFutureExpiry;
+        }
+
+        // The outbox publishes no processed-message query, so retention is read the way the outbox's own tests read
+        // it: a message it still holds owns its id, and a second send under that id is refused.
+        private static async Task<bool> RemainsInTheOutbox(InMemoryBrokeredMessageOutbox outbox, string messageId)
+        {
+            try
+            {
+                await outbox.SendToOutbox(CreateOutbound(messageId), new TransactionContext());
+                return false;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+
+        private static OutboundBrokeredMessage CreateOutbound(string messageId)
+            => new OutboundBrokeredMessage(messageId,
+                                           new byte[] { 1, 2, 3 },
+                                           new Dictionary<string, object>(),
+                                           "destination",
+                                           new TextPlainBodyConverter());
+
+        private static IConfiguration BuildConfigurationWithMinutesToLiveInMemory(string minutesToLiveInMemory)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:MinutesToLiveInMemory"] = minutesToLiveInMemory
+                })
+                .Build();
+
+        // The interval and the poller switch travel together because only the poller reads the interval, so every
+        // test that states one states the other.
+        private static IConfiguration BuildConfigurationWithOutboxProcessingInterval(string interval, bool enableOutboxPollingProcessor)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxProcessingIntervalInMilliseconds"] = interval,
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:EnableOutboxPollingProcessor"] = enableOutboxPollingProcessor.ToString()
+                })
+                .Build();
+
+        private static IConfiguration BuildConfigurationWithInMemoryInboxMaxEntries(string maxEntries)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:InMemoryInboxMaxEntries"] = maxEntries
+                })
+                .Build();
+
+        // The batch size travels alone because it is refused whether or not the poller is enabled.
+        private static IConfiguration BuildConfigurationWithOutboxPollBatchSize(string batchSize)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxPollBatchSize"] = batchSize
+                })
+                .Build();
+
+        // Both backoff settings travel alone because each is refused on its own terms, and because the pair is
+        // refused whether or not the poller is enabled.
+        private static IConfiguration BuildConfigurationWithOutboxDispatchBackoffBase(string baseInSeconds)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxDispatchBackoffBaseInSeconds"] = baseInSeconds
+                })
+                .Build();
+
+        private static IConfiguration BuildConfigurationWithOutboxDispatchBackoffCap(string capInSeconds)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxDispatchBackoffCapInSeconds"] = capInSeconds
+                })
+                .Build();
+
+        private static IConfiguration BuildConfigurationWithOutboxMaxDispatchAttempts(string maxDispatchAttempts)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:OutboxMaxDispatchAttempts"] = maxDispatchAttempts
+                })
+                .Build();
+
+        private static IConfiguration BuildConfigurationWithInMemoryInboxDeduplicationWindow(string windowInMinutes)
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:InMemoryInboxDeduplicationWindowInMinutes"] = windowInMinutes
+                })
+                .Build();
+
+        private static IConfiguration BuildConfigurationWithRouteMessagesToOutbox()
+            => new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    [$"{ReliabilityOptionsBuilder.ReliabilityOptionsSectionName}:RouteMessagesToOutbox"] = "true"
+                })
+                .Build();
+    }
+}

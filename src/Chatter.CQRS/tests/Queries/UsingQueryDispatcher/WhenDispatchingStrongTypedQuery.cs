@@ -1,0 +1,197 @@
+﻿using Chatter.CQRS.Context;
+using Chatter.CQRS.Queries;
+using Chatter.CQRS.Tests.Diagnostics;
+using Chatter.Testing.Core.Creators.Common;
+using FluentAssertions;
+using Microsoft.Extensions.Logging;
+using Moq;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
+
+namespace Chatter.CQRS.Tests.Queries.UsingQueryDispatcher
+{
+    [Collection(DiagnosticsCollection.Name)]
+    public class WhenDispatchingStrongTypedQuery : Testing.Core.Context
+    {
+        private readonly Mock<IServiceProvider> _serviceProvider = new Mock<IServiceProvider>();
+        private readonly Mock<IQueryHandler<TestQuery, string>> _handler = new Mock<IQueryHandler<TestQuery, string>>();
+        private readonly LoggerCreator<QueryDispatcher> _logger;
+        private readonly QueryDispatcher _sut;
+        private readonly TestQuery _query;
+
+        public class TestQuery : IQuery<string> { }
+
+        public class OtherTestQuery : IQuery<string> { }
+
+        public WhenDispatchingStrongTypedQuery()
+        {
+            _query = new TestQuery();
+            _serviceProvider.Setup(p => p.GetService(typeof(IQueryHandler<TestQuery, string>)))
+                .Returns(_handler.Object);
+            _logger = New.Common().Logger<QueryDispatcher>();
+            _sut = new QueryDispatcher(_serviceProvider.Object, _logger.Creation);
+        }
+
+        [Fact]
+        public async Task MustGetQueryHandlerFromStronglyTypedQuery()
+        {
+            await _sut.Query(_query);
+            _serviceProvider.Verify(p => p.GetService(typeof(IQueryHandler<TestQuery, string>)), Times.Once);
+        }
+
+        [Fact]
+        public async Task MustInvokeQueryHandlerWhenRegisteredWIthServiceProvider()
+        {
+            await _sut.Query(_query);
+            _handler.Verify(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task MustThrowIfNoQueryHandlerIsRegisteredWIthServiceProvider()
+        {
+            _serviceProvider.Setup(p => p.GetService(typeof(IQueryHandler<TestQuery, string>))).Returns(null);
+            await FluentActions.Invoking(async () => await _sut.Query(_query)).Should().ThrowAsync<Exception>();
+        }
+
+        [Fact]
+        public async Task MustThrowIfQueryHandlerThrowsException()
+        {
+            _handler.Setup(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>())).Throws<Exception>();
+            await FluentActions.Invoking(async () => await _sut.Query(_query)).Should().ThrowAsync<Exception>();
+        }
+
+        [Fact]
+        public async Task MustLogErrorIfExceptionIsCaught()
+        {
+            _serviceProvider.Setup(p => p.GetService(typeof(IQueryHandler<TestQuery, string>))).Throws<Exception>();
+            await FluentActions.Invoking(async () => await _sut.Query(_query)).Should().ThrowAsync<Exception>();
+            _logger.VerifyWasCalled(LogLevel.Error, times: Times.Once());
+        }
+
+        [Fact]
+        public async Task MustLogCaughtExceptionAsTheLogRecordExceptionWithoutStackTraceInMessage()
+        {
+            var fault = new Exception("query dispatch failed");
+            _serviceProvider.Setup(p => p.GetService(typeof(IQueryHandler<TestQuery, string>))).Throws(fault);
+            await FluentActions.Invoking(async () => await _sut.Query(_query)).Should().ThrowAsync<Exception>();
+            _logger.VerifyWasCalled(LogLevel.Error, $"Error dispatching query of type '{nameof(TestQuery)}'", fault, Times.Once());
+            _logger.LoggedMessages.Should().ContainSingle();
+            _logger.LoggedMessages[0].message.Should().Be($"Error dispatching query of type '{nameof(TestQuery)}'");
+        }
+
+        [Fact]
+        public async Task MustReuseTheCachedInvokerForRepeatedDispatchesOfTheSameQueryType()
+        {
+            await _sut.Query(_query);
+            var invoker = QueryDispatcher.CachedInvokers[(typeof(TestQuery), typeof(string))];
+
+            var nextScopeProvider = new Mock<IServiceProvider>();
+            nextScopeProvider.Setup(p => p.GetService(typeof(IQueryHandler<TestQuery, string>))).Returns(_handler.Object);
+            var nextScopeDispatcher = new QueryDispatcher(nextScopeProvider.Object, _logger.Creation);
+
+            await nextScopeDispatcher.Query(new TestQuery());
+
+            QueryDispatcher.CachedInvokers[(typeof(TestQuery), typeof(string))].Should().BeSameAs(invoker);
+            _serviceProvider.Verify(p => p.GetService(typeof(IQueryHandler<TestQuery, string>)), Times.Once);
+            nextScopeProvider.Verify(p => p.GetService(typeof(IQueryHandler<TestQuery, string>)), Times.Once);
+        }
+
+        [Fact]
+        public async Task MustResolveItsOwnHandlerForEachQueryTypeSharingAResultType()
+        {
+            var otherHandler = new Mock<IQueryHandler<OtherTestQuery, string>>();
+            otherHandler.Setup(h => h.Handle(It.IsAny<OtherTestQuery>(), It.IsAny<IQueryHandlerContext>())).ReturnsAsync("other result");
+            _serviceProvider.Setup(p => p.GetService(typeof(IQueryHandler<OtherTestQuery, string>))).Returns(otherHandler.Object);
+            _handler.Setup(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>())).ReturnsAsync("result");
+
+            var result = await _sut.Query(_query);
+            var otherResult = await _sut.Query(new OtherTestQuery());
+
+            result.Should().Be("result");
+            otherResult.Should().Be("other result");
+            _handler.Verify(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>()), Times.Once);
+            otherHandler.Verify(h => h.Handle(It.IsAny<OtherTestQuery>(), It.IsAny<IQueryHandlerContext>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task MustReturnValueFromQueryHandlerIfSuccessful()
+        {
+            _handler.Setup(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>())).ReturnsAsync("result");
+            var result = await _sut.Query(_query);
+            result.Should().BeAssignableTo<string>();
+            result.Should().NotBeNullOrEmpty();
+            result.Should().Be("result");
+        }
+
+        [Fact]
+        public async Task MustRethrowACallerRequestedCancellationAndLogItOnceAtDebugInsteadOfError()
+        {
+            var cancellation = ArrangeQueryHandlerThatFaultsAfterAnAwait(new OperationCanceledException("The caller cancelled the query."));
+
+            var thrown = await FluentActions.Invoking(async () => await _sut.Query(_query, ContextCancelledByTheCaller())).Should().ThrowAsync<OperationCanceledException>();
+
+            thrown.Which.Should().BeSameAs(cancellation);
+            _logger.VerifyWasCalled(LogLevel.Debug, $"Dispatch of query '{nameof(TestQuery)}' was cancelled by the caller.", cancellation, Times.Once());
+            _logger.VerifyWasCalled(LogLevel.Debug, times: Times.Once());
+            _logger.VerifyWasCalled(LogLevel.Error, times: Times.Never());
+        }
+
+        [Fact]
+        public async Task MustLogErrorNotDebugWhenTheCancellationWasNotRequestedByTheCaller()
+        {
+            var cancellation = ArrangeQueryHandlerThatFaultsAfterAnAwait(new OperationCanceledException("A spontaneous timeout cancelled the query handler."));
+
+            await FluentActions.Invoking(async () => await _sut.Query(_query, new QueryHandlerContext(CancellationToken.None))).Should().ThrowAsync<OperationCanceledException>();
+
+            _logger.VerifyWasCalled(LogLevel.Error, $"Error dispatching query of type '{nameof(TestQuery)}'", cancellation, Times.Once());
+            _logger.VerifyWasCalled(LogLevel.Error, times: Times.Once());
+            _logger.VerifyWasCalled(LogLevel.Debug, times: Times.Never());
+        }
+
+        [Fact]
+        public async Task MustLogTheFaultOnceAndRethrowItUnchangedWhenNoInvokerCanBeBuiltForTheRuntimeQueryType()
+        {
+            IQuery<string> valueTypeQuery = new ValueTypeQuery();
+
+            var thrown = await FluentActions.Invoking(async () => await _sut.Query(valueTypeQuery, new QueryHandlerContext())).Should().ThrowAsync<ArgumentException>();
+
+            _logger.VerifyWasCalled(LogLevel.Error, $"Error dispatching query of type '{nameof(ValueTypeQuery)}'", thrown.Which, Times.Once());
+            _logger.LoggedMessages.Should().ContainSingle();
+        }
+
+        [Fact]
+        public async Task MustFaultTheReturnedTaskWithANullReferenceExceptionAndLogNothingWhenTheQueryIsNull()
+        {
+            Task<string> dispatch = null;
+
+            Action startDispatch = () => dispatch = _sut.Query<string>(null, new QueryHandlerContext());
+
+            startDispatch.Should().NotThrow();
+
+            await FluentActions.Awaiting(() => dispatch).Should().ThrowAsync<NullReferenceException>();
+            _logger.LoggedMessages.Should().BeEmpty();
+        }
+
+        private TException ArrangeQueryHandlerThatFaultsAfterAnAwait<TException>(TException failure) where TException : Exception
+        {
+            _handler.Setup(h => h.Handle(It.IsAny<TestQuery>(), It.IsAny<IQueryHandlerContext>()))
+                .Returns(() => FaultAfterAnAwait(failure));
+            return failure;
+        }
+
+        private static QueryHandlerContext ContextCancelledByTheCaller()
+        {
+            using var cancellationSource = new CancellationTokenSource();
+            cancellationSource.Cancel();
+            return new QueryHandlerContext(cancellationSource.Token);
+        }
+
+        private static async Task<string> FaultAfterAnAwait(Exception failure)
+        {
+            await Task.Yield();
+            throw failure;
+        }
+    }
+}
